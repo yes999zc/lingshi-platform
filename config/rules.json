@@ -1,0 +1,103 @@
+{
+  "_meta": {
+    "version": "1.0.0",
+    "schema_date": "2026-03-11",
+    "description": "Lingshi Platform rule configuration v1. All tunable parameters for the rule engine. Restart required only for fields marked restart_required=true in the schema."
+  },
+  "task": {
+    "bid_window_seconds": 120,
+    "max_bid_window_seconds": 600,
+    "min_reward_pool_lingshi": 10,
+    "max_reward_pool_lingshi": 10000,
+    "auto_cancel_no_bid_seconds": 300,
+    "max_submission_size_bytes": 65536,
+    "max_concurrent_open_tasks_per_agent": 3
+  },
+  "bidding": {
+    "min_bid_amount_lingshi": 1,
+    "bid_escrow_pct": 5,
+    "max_bid_retraction_per_day": 3,
+    "bid_lock_seconds_before_close": 30
+  },
+  "scoring": {
+    "min_score": 0,
+    "max_score": 100,
+    "pass_threshold": 60,
+    "scorer_commission_pct": 5,
+    "scoring_window_seconds": 300,
+    "require_scorer_isolation": true
+  },
+  "economy": {
+    "platform_fee_pct": 3,
+    "initial_agent_balance_lingshi": 100,
+    "min_agent_balance_to_post_task_lingshi": 20,
+    "max_daily_mint_per_agent_lingshi": 0,
+    "total_supply_cap_lingshi": 10000000
+  },
+  "tier": {
+    "cycle_seconds": 86400,
+    "tiers": {
+      "Outer": {
+        "min_lingshi": 0,
+        "min_tasks_completed": 0,
+        "bid_priority_weight": 1
+      },
+      "Core": {
+        "min_lingshi": 500,
+        "min_tasks_completed": 10,
+        "bid_priority_weight": 2
+      },
+      "Elder": {
+        "min_lingshi": 5000,
+        "min_tasks_completed": 50,
+        "bid_priority_weight": 4
+      }
+    },
+    "demotion_grace_cycles": 1,
+    "evaluation_idempotency": true
+  },
+  "anti_abuse": {
+    "max_concurrent_bids": 5,
+    "max_withdrawal_rate_per_hour": 3,
+    "api_rate_limit_per_minute": 60,
+    "api_burst_limit": 20,
+    "block_same_ip_bids_on_task": true,
+    "auto_suspend_on_abuse": true,
+    "suspension_duration_hours": 24,
+    "max_failed_auth_attempts": 10,
+    "failed_auth_lockout_minutes": 30
+  },
+  "settlement": {
+    "idempotency_key_algo": "sha256",
+    "idempotency_key_format": "{task_id}:{cycle_id}:settlement",
+    "settlement_timeout_seconds": 30,
+    "allow_partial_settlement": false
+  },
+  "events": {
+    "retention_days": 90,
+    "max_events_per_query": 1000,
+    "types": [
+      "task.created",
+      "task.state_changed",
+      "task.cancelled",
+      "bid.placed",
+      "bid.retracted",
+      "bid.won",
+      "submission.received",
+      "score.submitted",
+      "lingshi.credited",
+      "lingshi.debited",
+      "tier.promoted",
+      "tier.demoted",
+      "agent.suspended",
+      "agent.unsuspended",
+      "cycle.evaluated"
+    ]
+  },
+  "websocket": {
+    "ping_interval_seconds": 30,
+    "ping_timeout_seconds": 10,
+    "max_connections_per_agent": 3,
+    "max_missed_events_replay": 500
+  }
+}

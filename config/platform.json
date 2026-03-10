@@ -1,0 +1,9 @@
+{
+  "name": "lingshi-platform",
+  "environment": "development",
+  "apiBasePath": "/api",
+  "websocketPath": "/ws",
+  "database": {
+    "path": "data/lingshi.sqlite"
+  }
+}
