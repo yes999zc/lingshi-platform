@@ -1,0 +1,67 @@
+CREATE TABLE IF NOT EXISTS agents (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'idle',
+  metadata TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  agent_id TEXT,
+  priority INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (agent_id) REFERENCES agents (id)
+);
+
+CREATE TABLE IF NOT EXISTS bids (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  bid_score REAL NOT NULL DEFAULT 0,
+  note TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (task_id) REFERENCES tasks (id),
+  FOREIGN KEY (agent_id) REFERENCES agents (id)
+);
+
+CREATE TABLE IF NOT EXISTS coalitions (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'forming',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS coalition_members (
+  id TEXT PRIMARY KEY,
+  coalition_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'member',
+  joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (coalition_id) REFERENCES coalitions (id),
+  FOREIGN KEY (agent_id) REFERENCES agents (id),
+  UNIQUE (coalition_id, agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS ledger (
+  id TEXT PRIMARY KEY,
+  entity_id TEXT NOT NULL,
+  entry_type TEXT NOT NULL,
+  amount REAL NOT NULL,
+  currency TEXT NOT NULL DEFAULT 'LSP',
+  note TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS events (
+  id TEXT PRIMARY KEY,
+  event_type TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  source TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

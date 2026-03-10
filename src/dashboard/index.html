@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LingShi MVP Dashboard</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f6f8fc;
+        --card: #ffffff;
+        --text: #1f2937;
+        --subtle: #6b7280;
+        --accent: #0f766e;
+        --border: #d1d5db;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Segoe UI", Arial, sans-serif;
+        background: radial-gradient(circle at top, #e2e8f0, var(--bg) 60%);
+        color: var(--text);
+      }
+
+      .page {
+        max-width: 880px;
+        margin: 40px auto;
+        padding: 0 20px 40px;
+      }
+
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 20px;
+        box-shadow: 0 8px 28px rgba(15, 23, 42, 0.08);
+      }
+
+      h1 {
+        margin: 0 0 10px;
+        font-size: 2rem;
+      }
+
+      p {
+        margin: 0;
+        color: var(--subtle);
+        line-height: 1.5;
+      }
+
+      .row {
+        margin-top: 16px;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      a {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        text-decoration: none;
+        border-radius: 9px;
+        padding: 10px 14px;
+        border: 1px solid var(--accent);
+        color: var(--accent);
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <section class="card">
+        <h1>LingShi Platform MVP</h1>
+        <p>Service skeleton is online. Use the API and websocket placeholders for initial integration tests.</p>
+        <div class="row">
+          <a href="/health">GET /health</a>
+          <a href="/api/agents">GET /api/agents</a>
+          <a href="/api/tasks">GET /api/tasks</a>
+          <a href="/api/ledger">GET /api/ledger</a>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
