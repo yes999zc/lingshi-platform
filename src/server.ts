@@ -16,8 +16,7 @@ const DASHBOARD_FILE = path.resolve(process.cwd(), "src", "dashboard", "index.ht
 export async function createServer() {
   const app = Fastify({ logger: true });
   const db = bootstrapDatabase();
-
-  attachWebsocketServer(app.server);
+  const websocketHooks = attachWebsocketServer(app.server);
 
   app.addHook("onClose", async () => {
     db.close();
@@ -36,7 +35,7 @@ export async function createServer() {
   });
 
   await app.register(agentsRoutes, { prefix: "/api", db });
-  await app.register(tasksRoutes, { prefix: "/api", db });
+  await app.register(tasksRoutes, { prefix: "/api", db, publishEvent: websocketHooks.publishEvent });
   await app.register(ledgerRoutes, { prefix: "/api" });
 
   return app;

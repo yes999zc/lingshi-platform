@@ -3,11 +3,15 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 
-const VALID_TASK_STATUSES = new Set(["open", "bidding", "assigned", "submitted", "scored", "settled", "cancelled"]);
-const BIDDABLE_STATUSES = new Set(["open", "bidding"]);
+import { TASK_STATES, validateTaskTransition } from "../engine/task-state";
+
+const VALID_TASK_STATUSES = new Set<string>([...TASK_STATES, "cancelled"]);
+
+type PublishEvent = (eventType: string, payload: unknown) => void;
 
 interface TasksRouteOptions {
   db: Database.Database;
+  publishEvent?: PublishEvent;
 }
 
 interface TaskRow {
@@ -358,6 +362,7 @@ function ensureTaskSchema(db: Database.Database) {
 
 const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) => {
   const { db } = options;
+  const publishEvent = options.publishEvent ?? (() => undefined);
 
   ensureTaskSchema(db);
 
@@ -418,10 +423,10 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
 
   const markTaskBiddingQuery = db.prepare(`
     UPDATE tasks
-    SET status = 'bidding',
+    SET status = @status,
         updated_at = @updated_at
     WHERE id = @id
-      AND status = 'open'
+      AND status = @current_status
   `);
 
   const getAgentByIdQuery = db.prepare(`
@@ -463,7 +468,14 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
   type PlaceBidResult =
     | { type: "task_not_found" }
     | { type: "agent_not_found" }
-    | { type: "status_conflict"; status: string }
+    | {
+        type: "status_conflict";
+        status: string;
+        from: string;
+        to: string;
+        message: string;
+        allowedNextStates: readonly string[];
+      }
     | { type: "ok"; bid: BidResponse; task: TaskResponse };
 
   const placeBid = db.transaction((payload: ValidCreateBidPayload & { taskId: string; bidId: string; now: string }) => {
@@ -473,21 +485,53 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       return { type: "task_not_found" } as PlaceBidResult;
     }
 
-    if (!BIDDABLE_STATUSES.has(taskRow.status)) {
-      return { type: "status_conflict", status: taskRow.status } as PlaceBidResult;
-    }
-
     const agentRow = getAgentByIdQuery.get(payload.agentId) as AgentIdRow | undefined;
 
     if (!agentRow) {
       return { type: "agent_not_found" } as PlaceBidResult;
     }
 
-    if (taskRow.status === "open") {
-      markTaskBiddingQuery.run({
+    if (taskRow.status !== "bidding") {
+      const transition = validateTaskTransition(taskRow.status, "bidding");
+
+      if (!transition.ok) {
+        return {
+          type: "status_conflict",
+          status: taskRow.status,
+          from: transition.from,
+          to: transition.to,
+          message: transition.message,
+          allowedNextStates: transition.allowed_next_states
+        } as PlaceBidResult;
+      }
+
+      const transitionResult = markTaskBiddingQuery.run({
         id: payload.taskId,
+        status: transition.to,
+        current_status: transition.from,
         updated_at: payload.now
       });
+
+      if (transitionResult.changes === 0) {
+        const refreshedConflictTask = getTaskByIdQuery.get(payload.taskId) as TaskRow | undefined;
+        const refreshedStatus = refreshedConflictTask?.status ?? taskRow.status;
+        const refreshedTransition = validateTaskTransition(refreshedStatus, "bidding");
+        const conflictMessage = refreshedTransition.ok
+          ? `Task state transition ${refreshedTransition.from} -> ${refreshedTransition.to} could not be persisted`
+          : refreshedTransition.message;
+        const allowedNextStates = refreshedTransition.ok
+          ? [refreshedTransition.to]
+          : refreshedTransition.allowed_next_states;
+
+        return {
+          type: "status_conflict",
+          status: refreshedStatus,
+          from: refreshedTransition.from,
+          to: refreshedTransition.to,
+          message: conflictMessage,
+          allowedNextStates
+        } as PlaceBidResult;
+      }
     }
 
     insertBidQuery.run({
@@ -607,9 +651,16 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       });
     }
 
+    const task = toTaskResponse(row);
+    publishEvent("task.posted", {
+      task_id: task.id,
+      status: task.status,
+      created_at: task.created_at
+    });
+
     return reply.code(201).send({
       data: {
-        task: toTaskResponse(row)
+        task
       }
     });
   });
@@ -656,11 +707,46 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     }
 
     if (result.type === "status_conflict") {
+      publishEvent("task.bid_result", {
+        task_id: taskId,
+        agent_id: validation.value.agentId,
+        accepted: false,
+        current_status: result.status,
+        attempted_transition: {
+          from: result.from,
+          to: result.to
+        }
+      });
+
       return reply.code(409).send({
         error: {
           code: "TASK_NOT_BIDDABLE",
-          message: `Task ${taskId} is in status "${result.status}" and cannot accept bids`
+          message: `Task ${taskId} cannot transition ${result.from} -> ${result.to} for bidding`,
+          details: {
+            current_status: result.status,
+            attempted_transition: {
+              from: result.from,
+              to: result.to
+            },
+            allowed_next_states: result.allowedNextStates
+          }
         }
+      });
+    }
+
+    publishEvent("task.bid_result", {
+      task_id: result.task.id,
+      bid_id: result.bid.id,
+      agent_id: result.bid.agent_id,
+      accepted: true,
+      task_status: result.task.status
+    });
+
+    if (result.task.status === "assigned" && result.task.agent_id) {
+      publishEvent("task.assigned", {
+        task_id: result.task.id,
+        agent_id: result.task.agent_id,
+        source: "placeholder"
       });
     }
 

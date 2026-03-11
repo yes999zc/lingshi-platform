@@ -1,6 +1,26 @@
 import type { Server } from "node:http";
 
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
+
+interface WebsocketEvent {
+  type: string;
+  payload: unknown;
+  emitted_at: string;
+}
+
+export interface WebsocketEventHooks {
+  publishEvent: (eventType: string, payload: unknown) => void;
+}
+
+function broadcastEvent(wss: WebSocketServer, event: WebsocketEvent) {
+  const serialized = JSON.stringify(event);
+
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(serialized);
+    }
+  });
+}
 
 export function attachWebsocketServer(server: Server) {
   const wss = new WebSocketServer({ noServer: true });
@@ -34,5 +54,13 @@ export function attachWebsocketServer(server: Server) {
     });
   });
 
-  return wss;
+  return {
+    publishEvent(eventType: string, payload: unknown) {
+      broadcastEvent(wss, {
+        type: eventType,
+        payload,
+        emitted_at: new Date().toISOString()
+      });
+    }
+  } satisfies WebsocketEventHooks;
 }
