@@ -13,9 +13,17 @@ const HOST = process.env.HOST ?? "0.0.0.0";
 const PORT = Number(process.env.PORT ?? 3000);
 const DASHBOARD_FILE = path.resolve(process.cwd(), "src", "dashboard", "index.html");
 
-export async function createServer() {
+export interface CreateServerOptions {
+  dbPath?: string;
+  schemaPath?: string;
+}
+
+export async function createServer(options: CreateServerOptions = {}) {
   const app = Fastify({ logger: true });
-  const db = bootstrapDatabase();
+  const db = bootstrapDatabase({
+    dbPath: options.dbPath,
+    schemaPath: options.schemaPath
+  });
   const websocketHooks = attachWebsocketServer(app.server);
 
   app.addHook("onClose", async () => {
@@ -36,7 +44,7 @@ export async function createServer() {
 
   await app.register(agentsRoutes, { prefix: "/api", db });
   await app.register(tasksRoutes, { prefix: "/api", db, publishEvent: websocketHooks.publishEvent });
-  await app.register(ledgerRoutes, { prefix: "/api" });
+  await app.register(ledgerRoutes, { prefix: "/api", db });
 
   return app;
 }
