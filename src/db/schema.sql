@@ -17,13 +17,24 @@ CREATE TABLE IF NOT EXISTS tasks (
   description TEXT,
   status TEXT NOT NULL DEFAULT 'open',
   agent_id TEXT,
+  assigned_bid_id TEXT,
+  submission_payload TEXT,
+  submitted_at TEXT,
+  score_quality REAL,
+  score_speed REAL,
+  score_innovation REAL,
+  final_score REAL,
+  scored_at TEXT,
+  settled_at TEXT,
+  settlement_ledger_id TEXT,
   complexity INTEGER NOT NULL DEFAULT 1,
   bounty_lingshi REAL NOT NULL DEFAULT 0,
   required_tags TEXT NOT NULL DEFAULT '[]',
   priority INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (agent_id) REFERENCES agents (agent_id)
+  FOREIGN KEY (agent_id) REFERENCES agents (agent_id),
+  FOREIGN KEY (assigned_bid_id) REFERENCES bids (id)
 );
 
 CREATE TABLE IF NOT EXISTS bids (
@@ -61,12 +72,21 @@ CREATE TABLE IF NOT EXISTS coalition_members (
 CREATE TABLE IF NOT EXISTS ledger (
   id TEXT PRIMARY KEY,
   entity_id TEXT NOT NULL,
+  task_id TEXT,
+  agent_id TEXT,
+  reason TEXT,
+  idempotency_key TEXT,
   entry_type TEXT NOT NULL,
   amount REAL NOT NULL,
   currency TEXT NOT NULL DEFAULT 'LSP',
   note TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (task_id) REFERENCES tasks (id),
+  FOREIGN KEY (agent_id) REFERENCES agents (agent_id)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_idempotency_key
+  ON ledger (idempotency_key);
 
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY,
