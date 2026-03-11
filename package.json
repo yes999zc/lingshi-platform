@@ -7,7 +7,9 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "smoke:task-state": "tsx scripts/task-state-smoke.ts",
-    "smoke:task-lifecycle": "tsx scripts/task-lifecycle-smoke.ts"
+    "smoke:task-lifecycle": "tsx scripts/task-lifecycle-smoke.ts",
+    "test:integration": "tsx scripts/integration-gate.ts",
+    "test:merge-gate": "tsx scripts/merge-gate.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.4.1",
