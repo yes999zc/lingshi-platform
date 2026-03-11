@@ -1,7 +1,8 @@
 import type Database from "better-sqlite3";
-import type { preHandlerHookHandler } from "fastify";
+import type { FastifyReply, preHandlerHookHandler } from "fastify";
 
 import { hashToken } from "../../auth/token";
+import { sendError } from "../error-envelope";
 
 interface AuthenticatedAgentRow {
   agent_id: string;
@@ -15,13 +16,8 @@ declare module "fastify" {
   }
 }
 
-function sendAuthError(reply: Parameters<preHandlerHookHandler>[1], code: string, message: string) {
-  return reply.code(401).send({
-    error: {
-      code,
-      message
-    }
-  });
+function sendAuthError(reply: FastifyReply, code: string, message: string, details: unknown = null) {
+  return sendError(reply, 401, code, message, details);
 }
 
 function readBearerTokenFromHeader(headerValue: string | undefined): { token?: string; error?: string } {
@@ -62,17 +58,23 @@ export function createAgentAuthMiddleware(db: Database.Database): preHandlerHook
 
     if (!parsedHeader.token) {
       if (parsedHeader.error === "missing_authorization_header") {
-        return sendAuthError(reply, "AGENT_AUTH_REQUIRED", "Bearer token is required");
+        return sendAuthError(reply, "AGENT_AUTH_REQUIRED", "Bearer token is required", {
+          expected_scheme: "Bearer"
+        });
       }
 
-      return sendAuthError(reply, "AGENT_AUTH_INVALID", "Authorization header must use Bearer token format");
+      return sendAuthError(reply, "AGENT_AUTH_INVALID", "Authorization header must use Bearer token format", {
+        expected_format: "Authorization: Bearer <token>"
+      });
     }
 
     const tokenHash = hashToken(parsedHeader.token);
     const agentRow = findAgentByTokenHashQuery.get(tokenHash) as AuthenticatedAgentRow | undefined;
 
     if (!agentRow) {
-      return sendAuthError(reply, "AGENT_AUTH_INVALID", "Invalid bearer token");
+      return sendAuthError(reply, "AGENT_AUTH_INVALID", "Invalid bearer token", {
+        reason: "token_not_recognized"
+      });
     }
 
     request.agentAuth = {
