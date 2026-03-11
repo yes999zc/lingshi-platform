@@ -24,7 +24,7 @@ export async function createServer(options: CreateServerOptions = {}) {
     dbPath: options.dbPath,
     schemaPath: options.schemaPath
   });
-  const websocketHooks = attachWebsocketServer(app.server);
+  const websocketHooks = attachWebsocketServer(app.server, db);
 
   app.addHook("onClose", async () => {
     db.close();
