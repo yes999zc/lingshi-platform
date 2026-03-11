@@ -1,7 +1,9 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 
 import type Database from "better-sqlite3";
 import type { FastifyPluginAsync, FastifyReply } from "fastify";
+
+import { hashToken } from "../auth/token";
 
 interface AgentRow {
   agent_id: string;
@@ -46,10 +48,6 @@ interface ValidRegisterPayload {
 
 interface AgentsRouteOptions {
   db: Database.Database;
-}
-
-function hashToken(token: string) {
-  return createHash("sha256").update(token).digest("hex");
 }
 
 function normalizeCapabilityTags(capabilityTags: unknown): { value?: string[]; issues: ValidationIssue[] } {

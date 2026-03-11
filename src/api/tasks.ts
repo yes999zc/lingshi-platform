@@ -3,10 +3,13 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 
+import { createAgentAuthMiddleware } from "./middleware/agent-auth";
+import { createAgentRateLimitMiddleware, resolveRateLimitPerMinuteFromEnv } from "./middleware/rate-limit";
 import { TASK_STATES, validateTaskTransition } from "../engine/task-state";
 
 const VALID_TASK_STATUSES = new Set<string>([...TASK_STATES, "cancelled"]);
 const DEFAULT_SETTLEMENT_REASON = "task_settlement";
+const DEFAULT_AGENT_OPEN_BID_CAP = 3;
 
 type PublishEvent = (eventType: string, payload: unknown) => void;
 
@@ -171,6 +174,10 @@ interface AgentIdRow {
   agent_id: string;
 }
 
+interface OpenBidCountRow {
+  open_bid_count: number;
+}
+
 interface TableInfoRow {
   name: string;
 }
@@ -206,6 +213,33 @@ function sendTaskStateConflict(reply: FastifyReply, taskId: string, conflict: St
         },
         allowed_next_states: conflict.allowedNextStates,
         reason: conflict.message
+      }
+    }
+  });
+}
+
+function parsePositiveInteger(value: string | undefined, fallback: number) {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
+function sendAgentForbidden(reply: FastifyReply, expectedAgentId: string, requestedAgentId: string, field: string) {
+  return reply.code(403).send({
+    error: {
+      code: "AGENT_FORBIDDEN",
+      message: `${field} does not match authenticated agent`,
+      details: {
+        authenticated_agent_id: expectedAgentId,
+        requested_agent_id: requestedAgentId
       }
     }
   });
@@ -774,6 +808,11 @@ function ensureTaskSchema(db: Database.Database) {
 const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) => {
   const { db } = options;
   const publishEvent = options.publishEvent ?? (() => undefined);
+  const openBidCap = parsePositiveInteger(process.env.AGENT_OPEN_BID_CAP, DEFAULT_AGENT_OPEN_BID_CAP);
+  const authMiddleware = createAgentAuthMiddleware(db);
+  const rateLimitMiddleware = createAgentRateLimitMiddleware({
+    maxRequestsPerMinute: resolveRateLimitPerMinuteFromEnv()
+  });
 
   ensureTaskSchema(db);
 
@@ -952,6 +991,14 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     LIMIT 1
   `);
 
+  const countOpenBidsByAgentQuery = db.prepare(`
+    SELECT COUNT(*) AS open_bid_count
+    FROM bids
+    INNER JOIN tasks ON tasks.id = bids.task_id
+    WHERE bids.agent_id = ?
+      AND tasks.status IN ('open', 'bidding', 'assigned', 'submitted', 'scored')
+  `);
+
   const getLedgerByIdQuery = db.prepare(`
     SELECT id, entity_id, task_id, agent_id, reason, idempotency_key, entry_type, amount, currency, note, created_at
     FROM ledger
@@ -995,6 +1042,7 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
   type PlaceBidResult =
     | { type: "task_not_found" }
     | { type: "agent_not_found" }
+    | { type: "bid_cap_exceeded"; openBidCount: number; cap: number }
     | { type: "status_conflict"; conflict: StatusConflictResult }
     | { type: "ok"; bid: BidResponse; task: TaskResponse };
 
@@ -1056,6 +1104,17 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
 
     if (!agentRow) {
       return { type: "agent_not_found" } as PlaceBidResult;
+    }
+
+    const openBidCountRow = countOpenBidsByAgentQuery.get(payload.agentId) as OpenBidCountRow | undefined;
+    const openBidCount = openBidCountRow?.open_bid_count ?? 0;
+
+    if (openBidCount >= openBidCap) {
+      return {
+        type: "bid_cap_exceeded",
+        openBidCount,
+        cap: openBidCap
+      } as PlaceBidResult;
     }
 
     if (taskRow.status !== "bidding") {
@@ -1495,6 +1554,24 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     }
   );
 
+  const protectedRoutePreHandlers = [authMiddleware, rateLimitMiddleware];
+
+  const getAuthenticatedAgentId = (request: FastifyRequest, reply: FastifyReply): string | undefined => {
+    const authenticatedAgentId = request.agentAuth?.agentId;
+
+    if (!authenticatedAgentId) {
+      reply.code(401).send({
+        error: {
+          code: "AGENT_AUTH_REQUIRED",
+          message: "Bearer token is required"
+        }
+      });
+      return undefined;
+    }
+
+    return authenticatedAgentId;
+  };
+
   app.get<{ Querystring: { status?: string } }>("/tasks", async (request, reply) => {
     const { status } = request.query;
 
@@ -1604,6 +1681,12 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     request: FastifyRequest<{ Params: { id: string }; Body: unknown }>,
     reply: FastifyReply
   ) => {
+    const authenticatedAgentId = getAuthenticatedAgentId(request, reply);
+
+    if (!authenticatedAgentId) {
+      return;
+    }
+
     const taskId = request.params.id.trim();
 
     if (!taskId) {
@@ -1614,6 +1697,10 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
 
     if (!validation.value) {
       return sendValidationError(reply, validation.issues);
+    }
+
+    if (validation.value.agentId !== authenticatedAgentId) {
+      return sendAgentForbidden(reply, authenticatedAgentId, validation.value.agentId, "agent_id");
     }
 
     const result = placeBid({
@@ -1637,6 +1724,20 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         error: {
           code: "AGENT_NOT_FOUND",
           message: `Agent ${validation.value.agentId} was not found`
+        }
+      });
+    }
+
+    if (result.type === "bid_cap_exceeded") {
+      return reply.code(429).send({
+        error: {
+          code: "AGENT_OPEN_BID_CAP_EXCEEDED",
+          message: `Agent ${validation.value.agentId} reached open bid cap of ${result.cap}`,
+          details: {
+            agent_id: validation.value.agentId,
+            open_bid_count: result.openBidCount,
+            open_bid_cap: result.cap
+          }
         }
       });
     }
@@ -1685,336 +1786,394 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     });
   };
 
-  app.post<{ Params: { id: string }; Body: unknown }>("/tasks/:id/bid", createBidHandler);
-  app.post<{ Params: { id: string }; Body: unknown }>("/tasks/:id/bids", createBidHandler);
+  app.post<{ Params: { id: string }; Body: unknown }>("/tasks/:id/bid", { preHandler: protectedRoutePreHandlers }, createBidHandler);
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    "/tasks/:id/bids",
+    { preHandler: protectedRoutePreHandlers },
+    createBidHandler
+  );
 
-  app.post<{ Params: { id: string }; Body: unknown }>("/tasks/:id/assign", async (request, reply) => {
-    const taskId = request.params.id.trim();
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    "/tasks/:id/assign",
+    { preHandler: protectedRoutePreHandlers },
+    async (request, reply) => {
+      const authenticatedAgentId = getAuthenticatedAgentId(request, reply);
 
-    if (!taskId) {
-      return sendValidationError(reply, [{ field: "id", message: "id is required" }]);
-    }
+      if (!authenticatedAgentId) {
+        return;
+      }
 
-    const validation = validateAssignTaskBody(request.body);
+      const taskId = request.params.id.trim();
 
-    if (!validation.value) {
-      return sendValidationError(reply, validation.issues);
-    }
+      if (!taskId) {
+        return sendValidationError(reply, [{ field: "id", message: "id is required" }]);
+      }
 
-    const result = assignTask({
-      ...validation.value,
-      taskId,
-      now: new Date().toISOString()
-    });
+      const validation = validateAssignTaskBody(request.body);
 
-    if (result.type === "task_not_found") {
-      return reply.code(404).send({
-        error: {
-          code: "TASK_NOT_FOUND",
-          message: `Task ${taskId} was not found`
-        }
+      if (!validation.value) {
+        return sendValidationError(reply, validation.issues);
+      }
+
+      if (validation.value.agentId && validation.value.agentId !== authenticatedAgentId) {
+        return sendAgentForbidden(reply, authenticatedAgentId, validation.value.agentId, "agent_id");
+      }
+
+      const result = assignTask({
+        ...validation.value,
+        agentId: validation.value.agentId ?? authenticatedAgentId,
+        taskId,
+        now: new Date().toISOString()
       });
-    }
 
-    if (result.type === "bid_not_found") {
-      return reply.code(404).send({
-        error: {
-          code: "TASK_BID_NOT_FOUND",
-          message: `No matching bid found for task ${taskId}`
-        }
+      if (result.type === "task_not_found") {
+        return reply.code(404).send({
+          error: {
+            code: "TASK_NOT_FOUND",
+            message: `Task ${taskId} was not found`
+          }
+        });
+      }
+
+      if (result.type === "bid_not_found") {
+        return reply.code(404).send({
+          error: {
+            code: "TASK_BID_NOT_FOUND",
+            message: `No matching bid found for task ${taskId}`
+          }
+        });
+      }
+
+      if (result.type === "agent_not_found") {
+        return reply.code(404).send({
+          error: {
+            code: "AGENT_NOT_FOUND",
+            message: "Winning bid agent was not found"
+          }
+        });
+      }
+
+      if (result.type === "assignment_mismatch") {
+        return reply.code(400).send({
+          error: {
+            code: "TASK_ASSIGNMENT_AGENT_MISMATCH",
+            message: "agent_id does not match bid_id owner",
+            details: {
+              requested_agent_id: result.requestedAgentId,
+              bid_agent_id: result.bidAgentId
+            }
+          }
+        });
+      }
+
+      if (result.type === "status_conflict") {
+        return sendTaskStateConflict(reply, taskId, result.conflict);
+      }
+
+      publishEvent("task.assigned", {
+        task_id: result.task.id,
+        bid_id: result.assignedBid.id,
+        agent_id: result.assignedBid.agent_id,
+        status: result.task.status,
+        assigned_at: result.assignedAt
       });
-    }
 
-    if (result.type === "agent_not_found") {
-      return reply.code(404).send({
-        error: {
-          code: "AGENT_NOT_FOUND",
-          message: "Winning bid agent was not found"
-        }
-      });
-    }
-
-    if (result.type === "assignment_mismatch") {
-      return reply.code(400).send({
-        error: {
-          code: "TASK_ASSIGNMENT_AGENT_MISMATCH",
-          message: "agent_id does not match bid_id owner",
-          details: {
-            requested_agent_id: result.requestedAgentId,
-            bid_agent_id: result.bidAgentId
+      return {
+        data: {
+          task: result.task,
+          assignment: {
+            bid_id: result.assignedBid.id,
+            agent_id: result.assignedBid.agent_id,
+            assigned_at: result.assignedAt
           }
         }
-      });
+      };
     }
+  );
 
-    if (result.type === "status_conflict") {
-      return sendTaskStateConflict(reply, taskId, result.conflict);
-    }
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    "/tasks/:id/submit",
+    { preHandler: protectedRoutePreHandlers },
+    async (request, reply) => {
+      const authenticatedAgentId = getAuthenticatedAgentId(request, reply);
 
-    publishEvent("task.assigned", {
-      task_id: result.task.id,
-      bid_id: result.assignedBid.id,
-      agent_id: result.assignedBid.agent_id,
-      status: result.task.status,
-      assigned_at: result.assignedAt
-    });
-
-    return {
-      data: {
-        task: result.task,
-        assignment: {
-          bid_id: result.assignedBid.id,
-          agent_id: result.assignedBid.agent_id,
-          assigned_at: result.assignedAt
-        }
+      if (!authenticatedAgentId) {
+        return;
       }
-    };
-  });
 
-  app.post<{ Params: { id: string }; Body: unknown }>("/tasks/:id/submit", async (request, reply) => {
-    const taskId = request.params.id.trim();
+      const taskId = request.params.id.trim();
 
-    if (!taskId) {
-      return sendValidationError(reply, [{ field: "id", message: "id is required" }]);
-    }
+      if (!taskId) {
+        return sendValidationError(reply, [{ field: "id", message: "id is required" }]);
+      }
 
-    const validation = validateSubmitTaskBody(request.body);
+      const validation = validateSubmitTaskBody(request.body);
 
-    if (!validation.value) {
-      return sendValidationError(reply, validation.issues);
-    }
+      if (!validation.value) {
+        return sendValidationError(reply, validation.issues);
+      }
 
-    const result = submitTask({
-      ...validation.value,
-      taskId,
-      now: new Date().toISOString()
-    });
+      if (validation.value.agentId && validation.value.agentId !== authenticatedAgentId) {
+        return sendAgentForbidden(reply, authenticatedAgentId, validation.value.agentId, "agent_id");
+      }
 
-    if (result.type === "task_not_found") {
-      return reply.code(404).send({
-        error: {
-          code: "TASK_NOT_FOUND",
-          message: `Task ${taskId} was not found`
-        }
+      const result = submitTask({
+        ...validation.value,
+        agentId: authenticatedAgentId,
+        taskId,
+        now: new Date().toISOString()
       });
-    }
 
-    if (result.type === "assignee_missing") {
-      return reply.code(409).send({
-        error: {
-          code: "TASK_ASSIGNEE_MISSING",
-          message: `Task ${taskId} has no assigned agent`
-        }
+      if (result.type === "task_not_found") {
+        return reply.code(404).send({
+          error: {
+            code: "TASK_NOT_FOUND",
+            message: `Task ${taskId} was not found`
+          }
+        });
+      }
+
+      if (result.type === "assignee_missing") {
+        return reply.code(409).send({
+          error: {
+            code: "TASK_ASSIGNEE_MISSING",
+            message: `Task ${taskId} has no assigned agent`
+          }
+        });
+      }
+
+      if (result.type === "forbidden_agent") {
+        return reply.code(403).send({
+          error: {
+            code: "TASK_SUBMITTER_FORBIDDEN",
+            message: `Task ${taskId} is assigned to another agent`,
+            details: {
+              expected_agent_id: result.expectedAgentId,
+              requested_agent_id: result.requestedAgentId
+            }
+          }
+        });
+      }
+
+      if (result.type === "status_conflict") {
+        return sendTaskStateConflict(reply, taskId, result.conflict);
+      }
+
+      publishEvent("task.submitted", {
+        task_id: result.task.id,
+        agent_id: result.submitterAgentId,
+        status: result.task.status,
+        submitted_at: result.submittedAt
       });
-    }
 
-    if (result.type === "forbidden_agent") {
-      return reply.code(403).send({
-        error: {
-          code: "TASK_SUBMITTER_FORBIDDEN",
-          message: `Task ${taskId} is assigned to another agent`,
-          details: {
-            expected_agent_id: result.expectedAgentId,
-            requested_agent_id: result.requestedAgentId
+      return {
+        data: {
+          task: result.task,
+          submission: {
+            agent_id: result.submitterAgentId,
+            submitted_at: result.submittedAt,
+            result: result.result
           }
         }
-      });
+      };
     }
+  );
 
-    if (result.type === "status_conflict") {
-      return sendTaskStateConflict(reply, taskId, result.conflict);
-    }
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    "/tasks/:id/score",
+    { preHandler: protectedRoutePreHandlers },
+    async (request, reply) => {
+      const authenticatedAgentId = getAuthenticatedAgentId(request, reply);
 
-    publishEvent("task.submitted", {
-      task_id: result.task.id,
-      agent_id: result.submitterAgentId,
-      status: result.task.status,
-      submitted_at: result.submittedAt
-    });
-
-    return {
-      data: {
-        task: result.task,
-        submission: {
-          agent_id: result.submitterAgentId,
-          submitted_at: result.submittedAt,
-          result: result.result
-        }
+      if (!authenticatedAgentId) {
+        return;
       }
-    };
-  });
 
-  app.post<{ Params: { id: string }; Body: unknown }>("/tasks/:id/score", async (request, reply) => {
-    const taskId = request.params.id.trim();
+      const taskId = request.params.id.trim();
 
-    if (!taskId) {
-      return sendValidationError(reply, [{ field: "id", message: "id is required" }]);
-    }
-
-    const validation = validateScoreTaskBody(request.body);
-
-    if (!validation.value) {
-      return sendValidationError(reply, validation.issues);
-    }
-
-    const result = scoreTask({
-      ...validation.value,
-      taskId,
-      now: new Date().toISOString()
-    });
-
-    if (result.type === "task_not_found") {
-      return reply.code(404).send({
-        error: {
-          code: "TASK_NOT_FOUND",
-          message: `Task ${taskId} was not found`
-        }
-      });
-    }
-
-    if (result.type === "assignee_missing") {
-      return reply.code(409).send({
-        error: {
-          code: "TASK_ASSIGNEE_MISSING",
-          message: `Task ${taskId} has no assigned agent`
-        }
-      });
-    }
-
-    if (result.type === "status_conflict") {
-      return sendTaskStateConflict(reply, taskId, result.conflict);
-    }
-
-    publishEvent("task.scored", {
-      task_id: result.task.id,
-      status: result.task.status,
-      scored_at: result.scoredAt,
-      quality: result.quality,
-      speed: result.speed,
-      innovation: result.innovation,
-      final_score: result.finalScore
-    });
-
-    return {
-      data: {
-        task: result.task,
-        score: {
-          quality: result.quality,
-          speed: result.speed,
-          innovation: result.innovation,
-          final_score: result.finalScore,
-          scored_at: result.scoredAt
-        }
+      if (!taskId) {
+        return sendValidationError(reply, [{ field: "id", message: "id is required" }]);
       }
-    };
-  });
 
-  app.post<{ Params: { id: string }; Body: unknown }>("/tasks/:id/settle", async (request, reply) => {
-    const taskId = request.params.id.trim();
+      const validation = validateScoreTaskBody(request.body);
 
-    if (!taskId) {
-      return sendValidationError(reply, [{ field: "id", message: "id is required" }]);
-    }
+      if (!validation.value) {
+        return sendValidationError(reply, validation.issues);
+      }
 
-    const validation = validateSettleTaskBody(request.body);
-
-    if (!validation.value) {
-      return sendValidationError(reply, validation.issues);
-    }
-
-    const result = settleTask({
-      ...validation.value,
-      taskId,
-      now: new Date().toISOString(),
-      ledgerId: randomUUID()
-    });
-
-    if (result.type === "task_not_found") {
-      return reply.code(404).send({
-        error: {
-          code: "TASK_NOT_FOUND",
-          message: `Task ${taskId} was not found`
-        }
+      const result = scoreTask({
+        ...validation.value,
+        taskId,
+        now: new Date().toISOString()
       });
-    }
 
-    if (result.type === "assignee_missing") {
-      return reply.code(409).send({
-        error: {
-          code: "TASK_ASSIGNEE_MISSING",
-          message: `Task ${taskId} has no assigned agent`
-        }
+      if (result.type === "task_not_found") {
+        return reply.code(404).send({
+          error: {
+            code: "TASK_NOT_FOUND",
+            message: `Task ${taskId} was not found`
+          }
+        });
+      }
+
+      if (result.type === "assignee_missing") {
+        return reply.code(409).send({
+          error: {
+            code: "TASK_ASSIGNEE_MISSING",
+            message: `Task ${taskId} has no assigned agent`
+          }
+        });
+      }
+
+      if (result.type === "status_conflict") {
+        return sendTaskStateConflict(reply, taskId, result.conflict);
+      }
+
+      publishEvent("task.scored", {
+        task_id: result.task.id,
+        status: result.task.status,
+        scored_at: result.scoredAt,
+        quality: result.quality,
+        speed: result.speed,
+        innovation: result.innovation,
+        final_score: result.finalScore
       });
-    }
 
-    if (result.type === "agent_not_found") {
-      return reply.code(404).send({
-        error: {
-          code: "AGENT_NOT_FOUND",
-          message: `Agent ${result.agentId} was not found`
-        }
-      });
-    }
-
-    if (result.type === "duplicate_idempotency") {
-      return reply.code(409).send({
-        error: {
-          code: "LEDGER_IDEMPOTENCY_CONFLICT",
-          message: "Settlement has already been applied for this idempotency key",
-          details: {
-            task_id: taskId,
-            ledger_id: result.ledger.id,
-            idempotency_key: result.ledger.idempotency_key
+      return {
+        data: {
+          task: result.task,
+          score: {
+            quality: result.quality,
+            speed: result.speed,
+            innovation: result.innovation,
+            final_score: result.finalScore,
+            scored_at: result.scoredAt
           }
         }
+      };
+    }
+  );
+
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    "/tasks/:id/settle",
+    { preHandler: protectedRoutePreHandlers },
+    async (request, reply) => {
+      const authenticatedAgentId = getAuthenticatedAgentId(request, reply);
+
+      if (!authenticatedAgentId) {
+        return;
+      }
+
+      const taskId = request.params.id.trim();
+
+      if (!taskId) {
+        return sendValidationError(reply, [{ field: "id", message: "id is required" }]);
+      }
+
+      const validation = validateSettleTaskBody(request.body);
+
+      if (!validation.value) {
+        return sendValidationError(reply, validation.issues);
+      }
+
+      if (validation.value.agentId && validation.value.agentId !== authenticatedAgentId) {
+        return sendAgentForbidden(reply, authenticatedAgentId, validation.value.agentId, "agent_id");
+      }
+
+      const result = settleTask({
+        ...validation.value,
+        taskId,
+        now: new Date().toISOString(),
+        ledgerId: randomUUID()
       });
-    }
 
-    if (result.type === "status_conflict") {
-      return sendTaskStateConflict(reply, taskId, result.conflict);
-    }
+      if (result.type === "task_not_found") {
+        return reply.code(404).send({
+          error: {
+            code: "TASK_NOT_FOUND",
+            message: `Task ${taskId} was not found`
+          }
+        });
+      }
 
-    if (result.type === "agent_balance_update_failed") {
-      return reply.code(500).send({
-        error: {
-          code: "AGENT_BALANCE_UPDATE_FAILED",
-          message: `Failed to credit agent ${result.agentId}`
-        }
+      if (result.type === "assignee_missing") {
+        return reply.code(409).send({
+          error: {
+            code: "TASK_ASSIGNEE_MISSING",
+            message: `Task ${taskId} has no assigned agent`
+          }
+        });
+      }
+
+      if (result.type === "agent_not_found") {
+        return reply.code(404).send({
+          error: {
+            code: "AGENT_NOT_FOUND",
+            message: `Agent ${result.agentId} was not found`
+          }
+        });
+      }
+
+      if (result.type === "duplicate_idempotency") {
+        return reply.code(409).send({
+          error: {
+            code: "LEDGER_IDEMPOTENCY_CONFLICT",
+            message: "Settlement has already been applied for this idempotency key",
+            details: {
+              task_id: taskId,
+              ledger_id: result.ledger.id,
+              idempotency_key: result.ledger.idempotency_key
+            }
+          }
+        });
+      }
+
+      if (result.type === "status_conflict") {
+        return sendTaskStateConflict(reply, taskId, result.conflict);
+      }
+
+      if (result.type === "agent_balance_update_failed") {
+        return reply.code(500).send({
+          error: {
+            code: "AGENT_BALANCE_UPDATE_FAILED",
+            message: `Failed to credit agent ${result.agentId}`
+          }
+        });
+      }
+
+      publishEvent("task.settled", {
+        task_id: result.task.id,
+        status: result.task.status,
+        settled_at: result.settledAt,
+        agent_id: result.payoutAgentId,
+        amount: result.payoutAmount,
+        reason: result.reason,
+        idempotency_key: result.idempotencyKey,
+        ledger_id: result.ledger.id
       });
-    }
 
-    publishEvent("task.settled", {
-      task_id: result.task.id,
-      status: result.task.status,
-      settled_at: result.settledAt,
-      agent_id: result.payoutAgentId,
-      amount: result.payoutAmount,
-      reason: result.reason,
-      idempotency_key: result.idempotencyKey,
-      ledger_id: result.ledger.id
-    });
-
-    return {
-      data: {
-        task: result.task,
-        settlement: {
-          agent_id: result.payoutAgentId,
-          amount: result.payoutAmount,
-          reason: result.reason,
-          idempotency_key: result.idempotencyKey,
-          settled_at: result.settledAt,
-          ledger: {
-            id: result.ledger.id,
-            entry_type: result.ledger.entry_type,
-            amount: result.ledger.amount,
-            currency: result.ledger.currency,
-            created_at: result.ledger.created_at,
-            note: parseJsonPayload(result.ledger.note)
+      return {
+        data: {
+          task: result.task,
+          settlement: {
+            agent_id: result.payoutAgentId,
+            amount: result.payoutAmount,
+            reason: result.reason,
+            idempotency_key: result.idempotencyKey,
+            settled_at: result.settledAt,
+            ledger: {
+              id: result.ledger.id,
+              entry_type: result.ledger.entry_type,
+              amount: result.ledger.amount,
+              currency: result.ledger.currency,
+              created_at: result.ledger.created_at,
+              note: parseJsonPayload(result.ledger.note)
+            }
           }
         }
-      }
-    };
-  });
+      };
+    }
+  );
 };
 
 export default tasksRoutes;

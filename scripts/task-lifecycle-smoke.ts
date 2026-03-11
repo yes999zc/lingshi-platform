@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import type { LightMyRequestResponse } from "light-my-request";
+import { WebSocket } from "ws";
 
 import { createServer } from "../src/server";
 
@@ -54,6 +55,56 @@ function parseJsonBody<T>(response: LightMyRequestResponse): T {
   return JSON.parse(response.body) as T;
 }
 
+function expectWebSocketHandshakeRejected(url: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url);
+    let settled = false;
+
+    const finish = (error?: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    };
+
+    ws.once("open", () => {
+      ws.close();
+      finish(new Error("expected websocket handshake to be rejected"));
+    });
+
+    ws.once("unexpected-response", (_request, response) => {
+      const statusCode = response.statusCode;
+      response.resume();
+      ws.terminate();
+
+      if (statusCode === 401 || statusCode === 403) {
+        finish();
+        return;
+      }
+
+      finish(new Error(`expected websocket rejection status 401/403, received ${statusCode ?? "unknown"}`));
+    });
+
+    ws.once("error", (error) => {
+      const message = error.message;
+
+      if (message.includes("Unexpected server response: 401") || message.includes("Unexpected server response: 403")) {
+        finish();
+        return;
+      }
+
+      finish(error);
+    });
+  });
+}
+
 async function main() {
   const tmpDir = mkdtempSync(path.join(tmpdir(), "lingshi-day4-smoke-"));
   const dbPath = path.join(tmpDir, "lingshi.sqlite");
@@ -75,6 +126,10 @@ async function main() {
     assert.equal(registerAgentResponse.statusCode, 201, "agent registration should succeed");
     const registerAgentPayload = parseJsonBody<ApiEnvelope<AgentRegisterResponse>>(registerAgentResponse);
     const agentId = registerAgentPayload.data.agent.agent_id;
+    const bearerToken = registerAgentPayload.data.token;
+    const authHeader = {
+      authorization: `Bearer ${bearerToken}`
+    };
 
     const createTaskResponse = await app.inject({
       method: "POST",
@@ -92,9 +147,23 @@ async function main() {
     const createTaskPayload = parseJsonBody<ApiEnvelope<TaskCreateResponse>>(createTaskResponse);
     const taskId = createTaskPayload.data.task.id;
 
+    const unauthorizedBidResponse = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${taskId}/bids`,
+      payload: {
+        agent_id: agentId,
+        confidence: 0.9,
+        estimated_cycles: 2,
+        bid_stake: 25
+      }
+    });
+
+    assert.equal(unauthorizedBidResponse.statusCode, 401, "unauthorized bid should be rejected");
+
     const bidResponse = await app.inject({
       method: "POST",
       url: `/api/tasks/${taskId}/bids`,
+      headers: authHeader,
       payload: {
         agent_id: agentId,
         confidence: 0.9,
@@ -107,9 +176,74 @@ async function main() {
     const bidPayload = parseJsonBody<ApiEnvelope<BidCreateResponse>>(bidResponse);
     const bidId = bidPayload.data.bid.id;
 
+    const createAuxTask = async (index: number) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/tasks",
+        payload: {
+          title: `Aux task ${index}`,
+          description: "Open bid cap coverage",
+          complexity: 1,
+          bounty_lingshi: 10,
+          required_tags: ["analysis"]
+        }
+      });
+
+      assert.equal(response.statusCode, 201, `aux task ${index} creation should succeed`);
+      const payload = parseJsonBody<ApiEnvelope<TaskCreateResponse>>(response);
+      return payload.data.task.id;
+    };
+
+    const auxTaskId1 = await createAuxTask(1);
+    const auxTaskId2 = await createAuxTask(2);
+    const auxTaskId3 = await createAuxTask(3);
+
+    const auxBidResponse1 = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${auxTaskId1}/bids`,
+      headers: authHeader,
+      payload: {
+        agent_id: agentId,
+        confidence: 0.8,
+        estimated_cycles: 2,
+        bid_stake: 5
+      }
+    });
+
+    assert.equal(auxBidResponse1.statusCode, 201, "second open bid should succeed");
+
+    const auxBidResponse2 = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${auxTaskId2}/bids`,
+      headers: authHeader,
+      payload: {
+        agent_id: agentId,
+        confidence: 0.75,
+        estimated_cycles: 3,
+        bid_stake: 4
+      }
+    });
+
+    assert.equal(auxBidResponse2.statusCode, 201, "third open bid should succeed");
+
+    const cappedBidResponse = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${auxTaskId3}/bids`,
+      headers: authHeader,
+      payload: {
+        agent_id: agentId,
+        confidence: 0.7,
+        estimated_cycles: 3,
+        bid_stake: 3
+      }
+    });
+
+    assert.equal(cappedBidResponse.statusCode, 429, "open bid cap should block fourth open bid");
+
     const assignResponse = await app.inject({
       method: "POST",
       url: `/api/tasks/${taskId}/assign`,
+      headers: authHeader,
       payload: {
         bid_id: bidId
       }
@@ -120,8 +254,8 @@ async function main() {
     const submitResponse = await app.inject({
       method: "POST",
       url: `/api/tasks/${taskId}/submit`,
+      headers: authHeader,
       payload: {
-        agent_id: agentId,
         result: {
           output: "done",
           metrics: {
@@ -136,6 +270,7 @@ async function main() {
     const scoreResponse = await app.inject({
       method: "POST",
       url: `/api/tasks/${taskId}/score`,
+      headers: authHeader,
       payload: {
         quality: 92,
         speed: 88,
@@ -149,6 +284,7 @@ async function main() {
     const settleResponse = await app.inject({
       method: "POST",
       url: `/api/tasks/${taskId}/settle`,
+      headers: authHeader,
       payload: {
         reason: "task_settlement"
       }
@@ -162,6 +298,7 @@ async function main() {
     const duplicateSettleResponse = await app.inject({
       method: "POST",
       url: `/api/tasks/${taskId}/settle`,
+      headers: authHeader,
       payload: {
         reason: "task_settlement"
       }
@@ -186,6 +323,19 @@ async function main() {
     );
 
     assert.equal(settlementEntries.length, 1, "ledger should contain exactly one settlement entry");
+
+    await app.listen({
+      host: "127.0.0.1",
+      port: 0
+    });
+
+    const address = app.server.address();
+
+    if (!address || typeof address === "string") {
+      throw new Error("unable to resolve websocket test address");
+    }
+
+    await expectWebSocketHandshakeRejected(`ws://127.0.0.1:${address.port}/ws`);
 
     console.log("task lifecycle smoke checks passed");
   } finally {
