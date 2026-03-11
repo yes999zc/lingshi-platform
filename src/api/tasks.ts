@@ -1,15 +1,23 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import type Database from "better-sqlite3";
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 
+import { sendError } from "./error-envelope";
 import { createAgentAuthMiddleware } from "./middleware/agent-auth";
-import { createAgentRateLimitMiddleware, resolveRateLimitPerMinuteFromEnv } from "./middleware/rate-limit";
+import {
+  createAgentRateLimitMiddleware,
+  resolveRateLimitMaxTrackedKeysFromEnv,
+  resolveRateLimitPerMinuteFromEnv
+} from "./middleware/rate-limit";
+import { EXPECTED_INDEX_CREATE_SQL } from "../db/expected-indexes";
 import { TASK_STATES, validateTaskTransition } from "../engine/task-state";
 
 const VALID_TASK_STATUSES = new Set<string>([...TASK_STATES, "cancelled"]);
 const DEFAULT_SETTLEMENT_REASON = "task_settlement";
 const DEFAULT_AGENT_OPEN_BID_CAP = 3;
+const SETTLEMENT_IDEMPOTENCY_PREFIX = "settle:v2";
+const SETTLEMENT_IDEMPOTENCY_ACTION = "settlement";
 
 type PublishEvent = (eventType: string, payload: unknown) => void;
 
@@ -191,30 +199,18 @@ interface StatusConflictResult {
 }
 
 function sendValidationError(reply: FastifyReply, issues: ValidationIssue[]) {
-  return reply.code(400).send({
-    error: {
-      code: "VALIDATION_ERROR",
-      message: "Invalid request payload",
-      details: issues
-    }
-  });
+  return sendError(reply, 400, "VALIDATION_ERROR", "Invalid request payload", issues);
 }
 
 function sendTaskStateConflict(reply: FastifyReply, taskId: string, conflict: StatusConflictResult) {
-  return reply.code(422).send({
-    error: {
-      code: "TASK_STATE_TRANSITION_INVALID",
-      message: `Task ${taskId} cannot transition ${conflict.from} -> ${conflict.to}`,
-      details: {
-        current_status: conflict.status,
-        attempted_transition: {
-          from: conflict.from,
-          to: conflict.to
-        },
-        allowed_next_states: conflict.allowedNextStates,
-        reason: conflict.message
-      }
-    }
+  return sendError(reply, 422, "TASK_STATE_TRANSITION_INVALID", `Task ${taskId} cannot transition ${conflict.from} -> ${conflict.to}`, {
+    current_status: conflict.status,
+    attempted_transition: {
+      from: conflict.from,
+      to: conflict.to
+    },
+    allowed_next_states: conflict.allowedNextStates,
+    reason: conflict.message
   });
 }
 
@@ -233,15 +229,9 @@ function parsePositiveInteger(value: string | undefined, fallback: number) {
 }
 
 function sendAgentForbidden(reply: FastifyReply, expectedAgentId: string, requestedAgentId: string, field: string) {
-  return reply.code(403).send({
-    error: {
-      code: "AGENT_FORBIDDEN",
-      message: `${field} does not match authenticated agent`,
-      details: {
-        authenticated_agent_id: expectedAgentId,
-        requested_agent_id: requestedAgentId
-      }
-    }
+  return sendError(reply, 403, "AGENT_FORBIDDEN", `${field} does not match authenticated agent`, {
+    authenticated_agent_id: expectedAgentId,
+    requested_agent_id: requestedAgentId
   });
 }
 
@@ -645,8 +635,52 @@ function roundToTwo(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
-function buildSettlementIdempotencyKey(taskId: string, reason: string, agentId: string) {
+function deriveSettlementCycleId(task: Pick<TaskRow, "scored_at" | "submitted_at" | "created_at">) {
+  if (task.scored_at) {
+    return `scored_at:${task.scored_at}`;
+  }
+
+  if (task.submitted_at) {
+    return `submitted_at:${task.submitted_at}`;
+  }
+
+  return `created_at:${task.created_at}`;
+}
+
+function buildSettlementIdempotencyCanonical(taskId: string, cycleId: string, agentId: string) {
+  return `task_id=${taskId}|cycle_id=${cycleId}|agent_id=${agentId}|action=${SETTLEMENT_IDEMPOTENCY_ACTION}`;
+}
+
+function buildSettlementIdempotencyKey(taskId: string, cycleId: string, agentId: string) {
+  const canonical = buildSettlementIdempotencyCanonical(taskId, cycleId, agentId);
+  const digest = createHash("sha256").update(canonical).digest("hex");
+  return `${SETTLEMENT_IDEMPOTENCY_PREFIX}:${digest}`;
+}
+
+function buildLegacySettlementIdempotencyKey(taskId: string, reason: string, agentId: string) {
   return `${taskId}:${reason}:${agentId}`;
+}
+
+function isLegacySettlementIdempotencyKeyForTaskAgent(idempotencyKey: string, taskId: string, agentId: string) {
+  return idempotencyKey.startsWith(`${taskId}:`) && idempotencyKey.endsWith(`:${agentId}`);
+}
+
+function readSettlementCycleIdFromLedgerNote(note: string | null): string | undefined {
+  const parsed = parseJsonPayload(note);
+
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return undefined;
+  }
+
+  const cycleId = (parsed as { cycle_id?: unknown }).cycle_id;
+
+  if (typeof cycleId !== "string") {
+    return undefined;
+  }
+
+  const normalized = cycleId.trim();
+
+  return normalized || undefined;
 }
 
 function isUniqueConstraintError(error: unknown): boolean {
@@ -802,7 +836,9 @@ function ensureTaskSchema(db: Database.Database) {
     db.exec("ALTER TABLE ledger ADD COLUMN idempotency_key TEXT");
   }
 
-  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_idempotency_key ON ledger (idempotency_key)");
+  for (const createIndexSql of EXPECTED_INDEX_CREATE_SQL) {
+    db.exec(createIndexSql);
+  }
 }
 
 const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) => {
@@ -811,7 +847,8 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
   const openBidCap = parsePositiveInteger(process.env.AGENT_OPEN_BID_CAP, DEFAULT_AGENT_OPEN_BID_CAP);
   const authMiddleware = createAgentAuthMiddleware(db);
   const rateLimitMiddleware = createAgentRateLimitMiddleware({
-    maxRequestsPerMinute: resolveRateLimitPerMinuteFromEnv()
+    maxRequestsPerMinute: resolveRateLimitPerMinuteFromEnv(),
+    maxTrackedKeys: resolveRateLimitMaxTrackedKeysFromEnv()
   });
 
   ensureTaskSchema(db);
@@ -1011,6 +1048,15 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     WHERE idempotency_key = ?
   `);
 
+  const listSettlementLedgerByTaskAndAgentQuery = db.prepare(`
+    SELECT id, entity_id, task_id, agent_id, reason, idempotency_key, entry_type, amount, currency, note, created_at
+    FROM ledger
+    WHERE task_id = @task_id
+      AND agent_id = @agent_id
+      AND entry_type = 'task_settlement'
+    ORDER BY created_at DESC
+  `);
+
   const insertLedgerEntryQuery = db.prepare(`
     INSERT INTO ledger (
       id,
@@ -1093,6 +1139,50 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         ledger: LedgerRow;
       };
 
+  const findDuplicateSettlementLedger = (
+    taskId: string,
+    payoutAgentId: string,
+    cycleId: string,
+    candidateIdempotencyKeys: readonly string[]
+  ): LedgerRow | undefined => {
+    for (const candidateKey of candidateIdempotencyKeys) {
+      const existingByKey = getLedgerByIdempotencyKeyQuery.get(candidateKey) as LedgerRow | undefined;
+
+      if (existingByKey) {
+        return existingByKey;
+      }
+    }
+
+    const historicalSettlements = listSettlementLedgerByTaskAndAgentQuery.all({
+      task_id: taskId,
+      agent_id: payoutAgentId
+    }) as LedgerRow[];
+
+    for (const settlement of historicalSettlements) {
+      const settlementKey = settlement.idempotency_key?.trim();
+
+      if (!settlementKey) {
+        continue;
+      }
+
+      if (candidateIdempotencyKeys.includes(settlementKey)) {
+        return settlement;
+      }
+
+      const settlementCycleId = readSettlementCycleIdFromLedgerNote(settlement.note);
+
+      if (settlementCycleId && settlementCycleId === cycleId) {
+        return settlement;
+      }
+
+      if (!settlementCycleId && isLegacySettlementIdempotencyKeyForTaskAgent(settlementKey, taskId, payoutAgentId)) {
+        return settlement;
+      }
+    }
+
+    return undefined;
+  };
+
   const placeBid = db.transaction((payload: ValidCreateBidPayload & { taskId: string; bidId: string; now: string }) => {
     const taskRow = getTaskByIdQuery.get(payload.taskId) as TaskRow | undefined;
 
@@ -1144,10 +1234,14 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         const refreshedConflictTask = getTaskByIdQuery.get(payload.taskId) as TaskRow | undefined;
         const refreshedStatus = refreshedConflictTask?.status ?? taskRow.status;
 
-        return {
-          type: "status_conflict",
-          conflict: toStatusConflict(refreshedStatus, "bidding")
-        } as PlaceBidResult;
+        if (refreshedStatus === "bidding") {
+          // Another request transitioned the task to bidding first; this bid can still be accepted.
+        } else {
+          return {
+            type: "status_conflict",
+            conflict: toStatusConflict(refreshedStatus, "bidding")
+          } as PlaceBidResult;
+        }
       }
     }
 
@@ -1423,8 +1517,23 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         return { type: "assignee_missing" } as SettleTaskResult;
       }
 
-      const idempotencyKey = buildSettlementIdempotencyKey(payload.taskId, payload.reason, payoutAgentId);
-      const existingLedgerByIdempotency = getLedgerByIdempotencyKeyQuery.get(idempotencyKey) as LedgerRow | undefined;
+      const cycleId = deriveSettlementCycleId(taskRow);
+      const idempotencyKey = buildSettlementIdempotencyKey(payload.taskId, cycleId, payoutAgentId);
+      const legacyIdempotencyKey = buildLegacySettlementIdempotencyKey(payload.taskId, payload.reason, payoutAgentId);
+      const legacyDefaultReasonIdempotencyKey = buildLegacySettlementIdempotencyKey(
+        payload.taskId,
+        DEFAULT_SETTLEMENT_REASON,
+        payoutAgentId
+      );
+      const duplicateKeyCandidates = Array.from(
+        new Set([idempotencyKey, legacyIdempotencyKey, legacyDefaultReasonIdempotencyKey])
+      );
+      const existingLedgerByIdempotency = findDuplicateSettlementLedger(
+        payload.taskId,
+        payoutAgentId,
+        cycleId,
+        duplicateKeyCandidates
+      );
 
       if (existingLedgerByIdempotency) {
         return {
@@ -1473,7 +1582,12 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       if (taskUpdateResult.changes === 0) {
         const refreshedTaskRow = getTaskByIdQuery.get(payload.taskId) as TaskRow | undefined;
         const refreshedStatus = refreshedTaskRow?.status ?? taskRow.status;
-        const refreshedLedger = getLedgerByIdempotencyKeyQuery.get(idempotencyKey) as LedgerRow | undefined;
+        const refreshedLedger = findDuplicateSettlementLedger(
+          payload.taskId,
+          payoutAgentId,
+          cycleId,
+          duplicateKeyCandidates
+        );
 
         if (refreshedLedger) {
           return {
@@ -1502,13 +1616,19 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
           note: JSON.stringify({
             task_id: payload.taskId,
             reason: payload.reason,
-            final_score: finalScore
+            final_score: finalScore,
+            cycle_id: cycleId
           }),
           created_at: payload.now
         });
       } catch (error) {
         if (isUniqueConstraintError(error)) {
-          const duplicateLedger = getLedgerByIdempotencyKeyQuery.get(idempotencyKey) as LedgerRow | undefined;
+          const duplicateLedger = findDuplicateSettlementLedger(
+            payload.taskId,
+            payoutAgentId,
+            cycleId,
+            duplicateKeyCandidates
+          );
 
           if (duplicateLedger) {
             return {
@@ -1560,11 +1680,8 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     const authenticatedAgentId = request.agentAuth?.agentId;
 
     if (!authenticatedAgentId) {
-      reply.code(401).send({
-        error: {
-          code: "AGENT_AUTH_REQUIRED",
-          message: "Bearer token is required"
-        }
+      sendError(reply, 401, "AGENT_AUTH_REQUIRED", "Bearer token is required", {
+        expected_scheme: "Bearer"
       });
       return undefined;
     }
@@ -1615,11 +1732,8 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     const row = getTaskByIdQuery.get(taskId) as TaskRow | undefined;
 
     if (!row) {
-      return reply.code(404).send({
-        error: {
-          code: "TASK_NOT_FOUND",
-          message: `Task ${taskId} was not found`
-        }
+      return sendError(reply, 404, "TASK_NOT_FOUND", `Task ${taskId} was not found`, {
+        task_id: taskId
       });
     }
 
@@ -1655,11 +1769,8 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     const row = getTaskByIdQuery.get(taskId) as TaskRow | undefined;
 
     if (!row) {
-      return reply.code(500).send({
-        error: {
-          code: "TASK_CREATION_FAILED",
-          message: "Task was created but could not be loaded"
-        }
+      return sendError(reply, 500, "TASK_CREATION_FAILED", "Task was created but could not be loaded", {
+        task_id: taskId
       });
     }
 
@@ -1711,35 +1822,29 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     });
 
     if (result.type === "task_not_found") {
-      return reply.code(404).send({
-        error: {
-          code: "TASK_NOT_FOUND",
-          message: `Task ${taskId} was not found`
-        }
+      return sendError(reply, 404, "TASK_NOT_FOUND", `Task ${taskId} was not found`, {
+        task_id: taskId
       });
     }
 
     if (result.type === "agent_not_found") {
-      return reply.code(404).send({
-        error: {
-          code: "AGENT_NOT_FOUND",
-          message: `Agent ${validation.value.agentId} was not found`
-        }
+      return sendError(reply, 404, "AGENT_NOT_FOUND", `Agent ${validation.value.agentId} was not found`, {
+        agent_id: validation.value.agentId
       });
     }
 
     if (result.type === "bid_cap_exceeded") {
-      return reply.code(429).send({
-        error: {
-          code: "AGENT_OPEN_BID_CAP_EXCEEDED",
-          message: `Agent ${validation.value.agentId} reached open bid cap of ${result.cap}`,
-          details: {
-            agent_id: validation.value.agentId,
-            open_bid_count: result.openBidCount,
-            open_bid_cap: result.cap
-          }
+      return sendError(
+        reply,
+        429,
+        "AGENT_OPEN_BID_CAP_EXCEEDED",
+        `Agent ${validation.value.agentId} reached open bid cap of ${result.cap}`,
+        {
+          agent_id: validation.value.agentId,
+          open_bid_count: result.openBidCount,
+          open_bid_cap: result.cap
         }
-      });
+      );
     }
 
     if (result.type === "status_conflict") {
@@ -1754,20 +1859,20 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         }
       });
 
-      return reply.code(409).send({
-        error: {
-          code: "TASK_NOT_BIDDABLE",
-          message: `Task ${taskId} cannot transition ${result.conflict.from} -> ${result.conflict.to} for bidding`,
-          details: {
-            current_status: result.conflict.status,
-            attempted_transition: {
-              from: result.conflict.from,
-              to: result.conflict.to
-            },
-            allowed_next_states: result.conflict.allowedNextStates
-          }
+      return sendError(
+        reply,
+        409,
+        "TASK_NOT_BIDDABLE",
+        `Task ${taskId} cannot transition ${result.conflict.from} -> ${result.conflict.to} for bidding`,
+        {
+          current_status: result.conflict.status,
+          attempted_transition: {
+            from: result.conflict.from,
+            to: result.conflict.to
+          },
+          allowed_next_states: result.conflict.allowedNextStates
         }
-      });
+      );
     }
 
     publishEvent("task.bid_result", {
@@ -1827,42 +1932,25 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       });
 
       if (result.type === "task_not_found") {
-        return reply.code(404).send({
-          error: {
-            code: "TASK_NOT_FOUND",
-            message: `Task ${taskId} was not found`
-          }
+        return sendError(reply, 404, "TASK_NOT_FOUND", `Task ${taskId} was not found`, {
+          task_id: taskId
         });
       }
 
       if (result.type === "bid_not_found") {
-        return reply.code(404).send({
-          error: {
-            code: "TASK_BID_NOT_FOUND",
-            message: `No matching bid found for task ${taskId}`
-          }
+        return sendError(reply, 404, "TASK_BID_NOT_FOUND", `No matching bid found for task ${taskId}`, {
+          task_id: taskId
         });
       }
 
       if (result.type === "agent_not_found") {
-        return reply.code(404).send({
-          error: {
-            code: "AGENT_NOT_FOUND",
-            message: "Winning bid agent was not found"
-          }
-        });
+        return sendError(reply, 404, "AGENT_NOT_FOUND", "Winning bid agent was not found");
       }
 
       if (result.type === "assignment_mismatch") {
-        return reply.code(400).send({
-          error: {
-            code: "TASK_ASSIGNMENT_AGENT_MISMATCH",
-            message: "agent_id does not match bid_id owner",
-            details: {
-              requested_agent_id: result.requestedAgentId,
-              bid_agent_id: result.bidAgentId
-            }
-          }
+        return sendError(reply, 400, "TASK_ASSIGNMENT_AGENT_MISMATCH", "agent_id does not match bid_id owner", {
+          requested_agent_id: result.requestedAgentId,
+          bid_agent_id: result.bidAgentId
         });
       }
 
@@ -1925,33 +2013,21 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       });
 
       if (result.type === "task_not_found") {
-        return reply.code(404).send({
-          error: {
-            code: "TASK_NOT_FOUND",
-            message: `Task ${taskId} was not found`
-          }
+        return sendError(reply, 404, "TASK_NOT_FOUND", `Task ${taskId} was not found`, {
+          task_id: taskId
         });
       }
 
       if (result.type === "assignee_missing") {
-        return reply.code(409).send({
-          error: {
-            code: "TASK_ASSIGNEE_MISSING",
-            message: `Task ${taskId} has no assigned agent`
-          }
+        return sendError(reply, 409, "TASK_ASSIGNEE_MISSING", `Task ${taskId} has no assigned agent`, {
+          task_id: taskId
         });
       }
 
       if (result.type === "forbidden_agent") {
-        return reply.code(403).send({
-          error: {
-            code: "TASK_SUBMITTER_FORBIDDEN",
-            message: `Task ${taskId} is assigned to another agent`,
-            details: {
-              expected_agent_id: result.expectedAgentId,
-              requested_agent_id: result.requestedAgentId
-            }
-          }
+        return sendError(reply, 403, "TASK_SUBMITTER_FORBIDDEN", `Task ${taskId} is assigned to another agent`, {
+          expected_agent_id: result.expectedAgentId,
+          requested_agent_id: result.requestedAgentId
         });
       }
 
@@ -2008,20 +2084,14 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       });
 
       if (result.type === "task_not_found") {
-        return reply.code(404).send({
-          error: {
-            code: "TASK_NOT_FOUND",
-            message: `Task ${taskId} was not found`
-          }
+        return sendError(reply, 404, "TASK_NOT_FOUND", `Task ${taskId} was not found`, {
+          task_id: taskId
         });
       }
 
       if (result.type === "assignee_missing") {
-        return reply.code(409).send({
-          error: {
-            code: "TASK_ASSIGNEE_MISSING",
-            message: `Task ${taskId} has no assigned agent`
-          }
+        return sendError(reply, 409, "TASK_ASSIGNEE_MISSING", `Task ${taskId} has no assigned agent`, {
+          task_id: taskId
         });
       }
 
@@ -2088,57 +2158,45 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       });
 
       if (result.type === "task_not_found") {
-        return reply.code(404).send({
-          error: {
-            code: "TASK_NOT_FOUND",
-            message: `Task ${taskId} was not found`
-          }
+        return sendError(reply, 404, "TASK_NOT_FOUND", `Task ${taskId} was not found`, {
+          task_id: taskId
         });
       }
 
       if (result.type === "assignee_missing") {
-        return reply.code(409).send({
-          error: {
-            code: "TASK_ASSIGNEE_MISSING",
-            message: `Task ${taskId} has no assigned agent`
-          }
+        return sendError(reply, 409, "TASK_ASSIGNEE_MISSING", `Task ${taskId} has no assigned agent`, {
+          task_id: taskId
         });
       }
 
       if (result.type === "agent_not_found") {
-        return reply.code(404).send({
-          error: {
-            code: "AGENT_NOT_FOUND",
-            message: `Agent ${result.agentId} was not found`
-          }
+        return sendError(reply, 404, "AGENT_NOT_FOUND", `Agent ${result.agentId} was not found`, {
+          agent_id: result.agentId
         });
       }
 
       if (result.type === "duplicate_idempotency") {
-        return reply.code(409).send({
-          error: {
-            code: "LEDGER_IDEMPOTENCY_CONFLICT",
-            message: "Settlement has already been applied for this idempotency key",
-            details: {
-              task_id: taskId,
-              ledger_id: result.ledger.id,
-              idempotency_key: result.ledger.idempotency_key
-            }
+        return sendError(
+          reply,
+          409,
+          "LEDGER_IDEMPOTENCY_CONFLICT",
+          "Settlement has already been applied for this idempotency key",
+          {
+            task_id: taskId,
+            ledger_id: result.ledger.id,
+            idempotency_key: result.ledger.idempotency_key
           }
+        );
+      }
+
+      if (result.type === "agent_balance_update_failed") {
+        return sendError(reply, 500, "AGENT_BALANCE_UPDATE_FAILED", `Failed to credit agent ${result.agentId}`, {
+          agent_id: result.agentId
         });
       }
 
       if (result.type === "status_conflict") {
         return sendTaskStateConflict(reply, taskId, result.conflict);
-      }
-
-      if (result.type === "agent_balance_update_failed") {
-        return reply.code(500).send({
-          error: {
-            code: "AGENT_BALANCE_UPDATE_FAILED",
-            message: `Failed to credit agent ${result.agentId}`
-          }
-        });
       }
 
       publishEvent("task.settled", {

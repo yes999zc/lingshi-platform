@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { WebSocket } from "ws";
 
+import { createAgentRateLimitMiddleware } from "../src/api/middleware/rate-limit";
 import { createServer } from "../src/server";
 
 type GateStatus = "pass" | "fail";
@@ -69,7 +70,8 @@ interface SettlementResponse {
 interface ErrorResponse {
   error: {
     code: string;
-    details?: Record<string, unknown>;
+    message: string;
+    details: unknown;
   };
 }
 
@@ -93,8 +95,31 @@ interface IntegrationState {
   settlementIdempotencyKey?: string;
 }
 
+interface MockReply {
+  statusCode?: number;
+  headers: Record<string, string>;
+  payload?: unknown;
+  header: (name: string, value: string) => MockReply;
+  code: (statusCode: number) => MockReply;
+  send: (payload: unknown) => MockReply;
+}
+
 function parseJsonBody<T>(body: string): T {
   return JSON.parse(body) as T;
+}
+
+function assertErrorEnvelope(payload: unknown, context: string): asserts payload is ErrorResponse {
+  assert.equal(typeof payload, "object", `${context}: payload should be an object`);
+  assert.notEqual(payload, null, `${context}: payload should not be null`);
+  const candidate = payload as { error?: { code?: unknown; message?: unknown; details?: unknown } };
+  assert.equal(typeof candidate.error, "object", `${context}: payload.error should be an object`);
+  assert.notEqual(candidate.error, null, `${context}: payload.error should not be null`);
+  assert.equal(typeof candidate.error?.code, "string", `${context}: payload.error.code should be a string`);
+  assert.equal(typeof candidate.error?.message, "string", `${context}: payload.error.message should be a string`);
+  assert.ok(
+    Object.prototype.hasOwnProperty.call(candidate.error ?? {}, "details"),
+    `${context}: payload.error.details should be present`
+  );
 }
 
 function formatError(error: unknown): string {
@@ -132,7 +157,25 @@ function maybeLog(quiet: boolean, line: string) {
   }
 }
 
-function expectWebSocketHandshakeRejected(url: string): Promise<number> {
+function createMockReply(): MockReply {
+  return {
+    headers: {},
+    header(name: string, value: string) {
+      this.headers[name.toLowerCase()] = value;
+      return this;
+    },
+    code(statusCode: number) {
+      this.statusCode = statusCode;
+      return this;
+    },
+    send(payload: unknown) {
+      this.payload = payload;
+      return this;
+    }
+  };
+}
+
+function expectWebSocketHandshakeRejected(url: string, acceptedStatuses: readonly number[] = [401, 403]): Promise<number> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url);
     let settled = false;
@@ -164,12 +207,12 @@ function expectWebSocketHandshakeRejected(url: string): Promise<number> {
       const statusCode = response.statusCode ?? 0;
       response.resume();
 
-      if (statusCode === 401 || statusCode === 403) {
+      if (acceptedStatuses.includes(statusCode)) {
         finish(undefined, statusCode);
         return;
       }
 
-      finish(new Error(`expected websocket rejection status 401/403, received ${statusCode}`));
+      finish(new Error(`expected websocket rejection status ${acceptedStatuses.join("/")}, received ${statusCode}`));
     });
 
     ws.once("error", (error) => {
@@ -178,7 +221,7 @@ function expectWebSocketHandshakeRejected(url: string): Promise<number> {
       if (match) {
         const statusCode = Number(match[1]);
 
-        if (statusCode === 401 || statusCode === 403) {
+        if (acceptedStatuses.includes(statusCode)) {
           finish(undefined, statusCode);
           return;
         }
@@ -189,9 +232,13 @@ function expectWebSocketHandshakeRejected(url: string): Promise<number> {
   });
 }
 
-function expectWebSocketHandshakeAccepted(url: string, expectedAgentId: string): Promise<void> {
+function openWebSocketAndAwaitWelcome(
+  url: string,
+  expectedAgentId: string,
+  options: ConstructorParameters<typeof WebSocket>[1] = {}
+): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, options);
     let settled = false;
     const timeout = setTimeout(() => {
       finish(new Error("timed out waiting for websocket welcome message"));
@@ -204,7 +251,9 @@ function expectWebSocketHandshakeAccepted(url: string, expectedAgentId: string):
 
       settled = true;
       clearTimeout(timeout);
-      ws.removeAllListeners();
+      ws.removeAllListeners("unexpected-response");
+      ws.removeAllListeners("error");
+      ws.removeAllListeners("message");
 
       if (error) {
         ws.terminate();
@@ -212,8 +261,7 @@ function expectWebSocketHandshakeAccepted(url: string, expectedAgentId: string):
         return;
       }
 
-      ws.close();
-      resolve();
+      resolve(ws);
     };
 
     ws.once("unexpected-response", (_request, response) => {
@@ -239,21 +287,117 @@ function expectWebSocketHandshakeAccepted(url: string, expectedAgentId: string):
   });
 }
 
+function closeWebSocket(ws: WebSocket): Promise<void> {
+  return new Promise((resolve) => {
+    if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      resolve();
+      return;
+    }
+
+    ws.once("close", () => resolve());
+    ws.close();
+  });
+}
+
+function waitForWebSocketClose(ws: WebSocket, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (ws.readyState === WebSocket.CLOSED) {
+      resolve();
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      ws.terminate();
+      reject(new Error("timed out waiting for websocket close"));
+    }, timeoutMs);
+
+    ws.once("close", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
+}
+
+async function expectWebSocketHandshakeAccepted(url: string, expectedAgentId: string): Promise<void> {
+  const ws = await openWebSocketAndAwaitWelcome(url, expectedAgentId);
+  await closeWebSocket(ws);
+}
+
 export async function runIntegrationGate(options: { quiet?: boolean } = {}): Promise<IntegrationGateSummary> {
   const quiet = options.quiet ?? false;
+  const wsEnvOverrides: Record<string, string> = {
+    WS_UPGRADE_RATE_LIMIT_PER_MINUTE: "30",
+    WS_MAX_CONNECTIONS_PER_AGENT: "2",
+    WS_HEARTBEAT_INTERVAL_MS: "120",
+    WS_HEARTBEAT_TIMEOUT_MS: "200"
+  };
+  const previousWsEnv: Record<string, string | undefined> = {};
+
+  for (const [key, value] of Object.entries(wsEnvOverrides)) {
+    previousWsEnv[key] = process.env[key];
+    process.env[key] = value;
+  }
+
   const tmpDir = mkdtempSync(path.join(tmpdir(), "lingshi-integration-gate-"));
   const dbPath = path.join(tmpDir, "lingshi.sqlite");
-  const app = await createServer({ dbPath });
-  app.log.level = "fatal";
+  let app: Awaited<ReturnType<typeof createServer>> | undefined;
   const state: IntegrationState = {};
   const results: GateResult[] = [];
 
   maybeLog(quiet, "Running integration gate checks...");
 
   try {
+    app = await createServer({ dbPath });
+    app.log.level = "fatal";
     await app.ready();
 
     const checks: Array<{ name: string; run: () => Promise<string> }> = [
+      {
+        name: "rate-limit-pruning",
+        run: async () => {
+          const middleware = createAgentRateLimitMiddleware({
+            maxRequestsPerMinute: 1,
+            maxTrackedKeys: 3
+          });
+
+          const callMiddleware = async (ip: string, agentId: string) => {
+            const reply = createMockReply();
+            await middleware(
+              {
+                ip,
+                agentAuth: {
+                  agentId
+                }
+              } as any,
+              reply as any
+            );
+            return reply;
+          };
+
+          await callMiddleware("10.0.0.1", "agent-a");
+          await callMiddleware("10.0.0.2", "agent-b");
+          await callMiddleware("10.0.0.3", "agent-c");
+          await callMiddleware("10.0.0.4", "agent-d");
+
+          const firstReplayAfterEviction = await callMiddleware("10.0.0.1", "agent-a");
+          assert.equal(
+            firstReplayAfterEviction.statusCode,
+            undefined,
+            "oldest entry should be pruned/evicted when max tracked keys is exceeded"
+          );
+
+          const immediateSecondReplay = await callMiddleware("10.0.0.1", "agent-a");
+          assert.equal(immediateSecondReplay.statusCode, 429, "rate limit should still apply after key re-tracking");
+          assertErrorEnvelope(immediateSecondReplay.payload, "rate-limit-pruning envelope");
+          assert.equal(
+            (immediateSecondReplay.payload as ErrorResponse).error.code,
+            "RATE_LIMIT_EXCEEDED",
+            "rate-limit-pruning should keep existing error envelope code"
+          );
+
+          return "bounded key tracking retained rate-limit behavior and envelope";
+        }
+      },
       {
         name: "health",
         run: async () => {
@@ -420,6 +564,11 @@ export async function runIntegrationGate(options: { quiet?: boolean } = {}): Pro
           assert.equal(settlePayload.data.settlement.agent_id, state.agentId, "settlement should pay the assigned agent");
           assert.equal(settlePayload.data.settlement.amount, 108, "settlement amount should match score-weighted payout");
           assert.equal(settlePayload.data.settlement.reason, "task_settlement", "settlement reason should match request");
+          assert.match(
+            settlePayload.data.settlement.idempotency_key,
+            /^settle:v2:[a-f0-9]{64}$/,
+            "settlement idempotency key should use hashed v2 format"
+          );
 
           state.settlementIdempotencyKey = settlePayload.data.settlement.idempotency_key;
 
@@ -442,13 +591,22 @@ export async function runIntegrationGate(options: { quiet?: boolean } = {}): Pro
             url: `/api/tasks/${state.taskId}/settle`,
             headers: authHeader,
             payload: {
-              reason: "task_settlement"
+              reason: "task_settlement_retry"
             }
           });
 
           assert.equal(duplicateSettleResponse.statusCode, 409, "duplicate settlement should return 409");
           const duplicatePayload = parseJsonBody<ErrorResponse>(duplicateSettleResponse.body);
           assert.equal(duplicatePayload.error.code, "LEDGER_IDEMPOTENCY_CONFLICT", "duplicate settle should enforce idempotency");
+
+          if (state.settlementIdempotencyKey) {
+            const details = duplicatePayload.error.details as { idempotency_key?: unknown } | undefined;
+            assert.equal(
+              details?.idempotency_key,
+              state.settlementIdempotencyKey,
+              "duplicate settlement should reference existing v2 idempotency key"
+            );
+          }
 
           const ledgerResponse = await app.inject({
             method: "GET",
@@ -479,10 +637,83 @@ export async function runIntegrationGate(options: { quiet?: boolean } = {}): Pro
         }
       },
       {
-        name: "ws-auth",
+        name: "protected-error-envelope",
         run: async () => {
-          assert.ok(state.token, "token must be initialized before websocket auth check");
-          assert.ok(state.agentId, "agent id must be initialized before websocket auth check");
+          assert.ok(state.taskId, "task id must be initialized before protected envelope check");
+
+          const protectedRequests: Array<{ url: string; payload: Record<string, unknown> }> = [
+            {
+              url: `/api/tasks/${state.taskId}/bids`,
+              payload: {
+                agent_id: "missing-auth-agent",
+                confidence: 0.1,
+                estimated_cycles: 1,
+                bid_stake: 0
+              }
+            },
+            {
+              url: `/api/tasks/${state.taskId}/assign`,
+              payload: {
+                bid_id: "missing-auth-bid"
+              }
+            },
+            {
+              url: `/api/tasks/${state.taskId}/submit`,
+              payload: {
+                result: { ok: true }
+              }
+            },
+            {
+              url: `/api/tasks/${state.taskId}/score`,
+              payload: {
+                quality: 10,
+                speed: 10,
+                innovation: 10
+              }
+            },
+            {
+              url: `/api/tasks/${state.taskId}/settle`,
+              payload: {
+                reason: "missing_auth"
+              }
+            }
+          ];
+
+          for (const request of protectedRequests) {
+            const response = await app.inject({
+              method: "POST",
+              url: request.url,
+              payload: request.payload
+            });
+
+            assert.equal(response.statusCode, 401, `${request.url} should reject missing auth with 401`);
+            const payload = parseJsonBody<unknown>(response.body);
+            assertErrorEnvelope(payload, `${request.url} missing auth`);
+            assert.equal((payload as ErrorResponse).error.code, "AGENT_AUTH_REQUIRED");
+          }
+
+          const invalidHeaderResponse = await app.inject({
+            method: "POST",
+            url: protectedRequests[0].url,
+            headers: {
+              authorization: "Token not-bearer"
+            },
+            payload: protectedRequests[0].payload
+          });
+
+          assert.equal(invalidHeaderResponse.statusCode, 401, "invalid auth header format should return 401");
+          const invalidHeaderPayload = parseJsonBody<unknown>(invalidHeaderResponse.body);
+          assertErrorEnvelope(invalidHeaderPayload, "invalid auth header");
+          assert.equal((invalidHeaderPayload as ErrorResponse).error.code, "AGENT_AUTH_INVALID");
+
+          return "protected endpoint auth failures returned consistent error envelope";
+        }
+      },
+      {
+        name: "ws-hardening",
+        run: async () => {
+          assert.ok(state.token, "token must be initialized before websocket hardening check");
+          assert.ok(state.agentId, "agent id must be initialized before websocket hardening check");
 
           await app.listen({
             host: "127.0.0.1",
@@ -496,11 +727,42 @@ export async function runIntegrationGate(options: { quiet?: boolean } = {}): Pro
           }
 
           const baseWsUrl = `ws://127.0.0.1:${address.port}/ws`;
-          await expectWebSocketHandshakeRejected(baseWsUrl);
-          await expectWebSocketHandshakeRejected(`${baseWsUrl}?token=invalid-token`);
-          await expectWebSocketHandshakeAccepted(`${baseWsUrl}?token=${encodeURIComponent(state.token)}`, state.agentId);
+          await expectWebSocketHandshakeRejected(baseWsUrl, [401]);
+          const rejectedStatuses = await Promise.all(
+            Array.from({ length: 8 }, (_unused, index) =>
+              expectWebSocketHandshakeRejected(`${baseWsUrl}?token=invalid-token-${index}`, [401, 403])
+            )
+          );
+          assert.equal(rejectedStatuses.length, 8, "invalid token burst should reject all websocket upgrades");
+          assert.ok(
+            rejectedStatuses.every((statusCode) => statusCode === 401 || statusCode === 403),
+            "invalid token burst should only return unauthorized/forbidden statuses"
+          );
+          const authedWsUrl = `${baseWsUrl}?token=${encodeURIComponent(state.token)}`;
 
-          return `websocket auth validated on port ${address.port}`;
+          await expectWebSocketHandshakeAccepted(authedWsUrl, state.agentId);
+          await expectWebSocketHandshakeAccepted(authedWsUrl, state.agentId);
+
+          const connectionA = await openWebSocketAndAwaitWelcome(authedWsUrl, state.agentId);
+          const connectionB = await openWebSocketAndAwaitWelcome(authedWsUrl, state.agentId);
+          const connectionCapStatus = await expectWebSocketHandshakeRejected(authedWsUrl, [403]);
+          assert.equal(connectionCapStatus, 403, "third concurrent websocket for same agent should be rejected by cap");
+          await Promise.all([closeWebSocket(connectionA), closeWebSocket(connectionB)]);
+
+          const zombieSocket = await openWebSocketAndAwaitWelcome(authedWsUrl, state.agentId, { autoPong: false } as any);
+          await waitForWebSocketClose(zombieSocket, 3000);
+
+          const rateLimitedStatuses = await Promise.all(
+            Array.from({ length: 20 }, (_unused, index) =>
+              expectWebSocketHandshakeRejected(`${baseWsUrl}?token=invalid-rate-limit-${index}`, [401, 403, 429])
+            )
+          );
+          assert.ok(
+            rateLimitedStatuses.some((statusCode) => statusCode === 429),
+            "upgrade burst should trigger websocket upgrade rate limiting"
+          );
+
+          return `websocket auth, cap, keepalive cleanup, and upgrade rate limiting validated on port ${address.port}`;
         }
       }
     ];
@@ -512,8 +774,18 @@ export async function runIntegrationGate(options: { quiet?: boolean } = {}): Pro
       maybeLog(quiet, `[${label}] ${result.name} (${result.durationMs}ms) - ${result.detail}`);
     }
   } finally {
-    await app.close();
+    if (app) {
+      await app.close();
+    }
     rmSync(tmpDir, { recursive: true, force: true });
+
+    for (const [key, previousValue] of Object.entries(previousWsEnv)) {
+      if (previousValue === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = previousValue;
+      }
+    }
   }
 
   const passed = results.every((result) => result.status === "pass");

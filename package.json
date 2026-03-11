@@ -8,8 +8,12 @@
     "start": "node dist/server.js",
     "smoke:task-state": "tsx scripts/task-state-smoke.ts",
     "smoke:task-lifecycle": "tsx scripts/task-lifecycle-smoke.ts",
+    "stress:lifecycle-settlement": "tsx scripts/lifecycle-settlement-stress.ts",
+    "check:indexes": "tsx scripts/index-sanity.ts",
+    "check:indexes:strict": "tsx scripts/index-sanity.ts --fail-on-warn",
     "test:integration": "tsx scripts/integration-gate.ts",
-    "test:merge-gate": "tsx scripts/merge-gate.ts"
+    "test:merge-gate": "tsx scripts/merge-gate.ts",
+    "release:readiness": "tsx scripts/release-readiness.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.4.1",

@@ -88,6 +88,27 @@ CREATE TABLE IF NOT EXISTS ledger (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_idempotency_key
   ON ledger (idempotency_key);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_token_hash
+  ON agents (token_hash);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_created_at
+  ON tasks (created_at);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_status_created_at
+  ON tasks (status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_bids_task_id
+  ON bids (task_id);
+
+CREATE INDEX IF NOT EXISTS idx_bids_agent_id
+  ON bids (agent_id);
+
+CREATE INDEX IF NOT EXISTS idx_bids_task_agent_confidence_created_at
+  ON bids (task_id, agent_id, confidence, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_ledger_created_at
+  ON ledger (created_at);
+
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY,
   event_type TEXT NOT NULL,
