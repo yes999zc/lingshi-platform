@@ -1,8 +1,12 @@
 CREATE TABLE IF NOT EXISTS agents (
-  id TEXT PRIMARY KEY,
+  agent_id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'idle',
-  metadata TEXT,
+  tier TEXT NOT NULL DEFAULT 'outer',
+  lingshi_balance REAL NOT NULL DEFAULT 0,
+  capability_tags TEXT NOT NULL DEFAULT '[]',
+  token_hash TEXT NOT NULL,
+  last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  status TEXT NOT NULL DEFAULT 'offline',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -13,10 +17,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   description TEXT,
   status TEXT NOT NULL DEFAULT 'open',
   agent_id TEXT,
+  complexity INTEGER NOT NULL DEFAULT 1,
+  bounty_lingshi REAL NOT NULL DEFAULT 0,
+  required_tags TEXT NOT NULL DEFAULT '[]',
   priority INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (agent_id) REFERENCES agents (id)
+  FOREIGN KEY (agent_id) REFERENCES agents (agent_id)
 );
 
 CREATE TABLE IF NOT EXISTS bids (
@@ -25,9 +32,12 @@ CREATE TABLE IF NOT EXISTS bids (
   agent_id TEXT NOT NULL,
   bid_score REAL NOT NULL DEFAULT 0,
   note TEXT,
+  confidence REAL NOT NULL DEFAULT 0,
+  estimated_cycles INTEGER NOT NULL DEFAULT 1,
+  bid_stake REAL NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (task_id) REFERENCES tasks (id),
-  FOREIGN KEY (agent_id) REFERENCES agents (id)
+  FOREIGN KEY (agent_id) REFERENCES agents (agent_id)
 );
 
 CREATE TABLE IF NOT EXISTS coalitions (
@@ -44,7 +54,7 @@ CREATE TABLE IF NOT EXISTS coalition_members (
   role TEXT NOT NULL DEFAULT 'member',
   joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (coalition_id) REFERENCES coalitions (id),
-  FOREIGN KEY (agent_id) REFERENCES agents (id),
+  FOREIGN KEY (agent_id) REFERENCES agents (agent_id),
   UNIQUE (coalition_id, agent_id)
 );
 

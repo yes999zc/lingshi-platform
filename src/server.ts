@@ -35,8 +35,8 @@ export async function createServer() {
     reply.type("text/html").send(html);
   });
 
-  await app.register(agentsRoutes, { prefix: "/api" });
-  await app.register(tasksRoutes, { prefix: "/api" });
+  await app.register(agentsRoutes, { prefix: "/api", db });
+  await app.register(tasksRoutes, { prefix: "/api", db });
   await app.register(ledgerRoutes, { prefix: "/api" });
 
   return app;
