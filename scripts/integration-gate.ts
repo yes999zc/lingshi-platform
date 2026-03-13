@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 
-import { WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
 import { createAgentRateLimitMiddleware } from "../src/api/middleware/rate-limit";
 import { createServer } from "../src/server";
@@ -90,6 +92,8 @@ interface LedgerListResponse {
 interface IntegrationState {
   agentId?: string;
   token?: string;
+  scorerId?: string;
+  scorerToken?: string;
   taskId?: string;
   bidId?: string;
   settlementIdempotencyKey?: string;
@@ -102,6 +106,46 @@ interface MockReply {
   header: (name: string, value: string) => MockReply;
   code: (statusCode: number) => MockReply;
   send: (payload: unknown) => MockReply;
+}
+
+class InMemoryWebSocket extends EventEmitter {
+  readyState = WebSocket.OPEN;
+  sentMessages: string[] = [];
+  private closed = false;
+
+  constructor(private readonly autoPong: boolean) {
+    super();
+  }
+
+  send(payload: unknown) {
+    this.sentMessages.push(Buffer.isBuffer(payload) ? payload.toString("utf8") : String(payload));
+  }
+
+  ping() {
+    if (this.readyState !== WebSocket.OPEN || !this.autoPong) {
+      return;
+    }
+
+    setImmediate(() => {
+      if (this.readyState === WebSocket.OPEN) {
+        this.emit("pong");
+      }
+    });
+  }
+
+  terminate() {
+    this.close();
+  }
+
+  close() {
+    if (this.closed) {
+      return;
+    }
+
+    this.closed = true;
+    this.readyState = WebSocket.CLOSED;
+    this.emit("close");
+  }
 }
 
 function parseJsonBody<T>(body: string): T {
@@ -241,7 +285,7 @@ function openWebSocketAndAwaitWelcome(
     const ws = new WebSocket(url, options);
     let settled = false;
     const timeout = setTimeout(() => {
-      finish(new Error("timed out waiting for websocket welcome message"));
+      finish(new Error("timed out waiting for websocket connected message"));
     }, 3000);
 
     const finish = (error?: Error) => {
@@ -273,8 +317,8 @@ function openWebSocketAndAwaitWelcome(
     ws.once("message", (raw) => {
       try {
         const message = JSON.parse(raw.toString()) as { type?: string; agent_id?: string | null };
-        assert.equal(message.type, "welcome", "expected websocket welcome event");
-        assert.equal(message.agent_id, expectedAgentId, "welcome event should include authenticated agent id");
+        assert.equal(message.type, "connected", "expected websocket connected event");
+        assert.equal(message.agent_id, expectedAgentId, "connected event should include authenticated agent id");
         finish();
       } catch (error) {
         finish(error instanceof Error ? error : new Error(String(error)));
@@ -321,6 +365,152 @@ function waitForWebSocketClose(ws: WebSocket, timeoutMs: number): Promise<void> 
 async function expectWebSocketHandshakeAccepted(url: string, expectedAgentId: string): Promise<void> {
   const ws = await openWebSocketAndAwaitWelcome(url, expectedAgentId);
   await closeWebSocket(ws);
+}
+
+function parseUpgradeStatus(response: string): number | undefined {
+  const match = /^HTTP\/1.1\s+(\d{3})\s/m.exec(response);
+  if (!match) {
+    return undefined;
+  }
+
+  return Number.parseInt(match[1], 10);
+}
+
+function probeInMemoryUpgrade(
+  server: ReturnType<typeof createServer> extends Promise<infer T> ? T["server"] : never,
+  url: string,
+  acceptedSockets: InMemoryWebSocket[],
+  remoteAddress = "127.0.0.1"
+): { statusCode: number; socket?: InMemoryWebSocket } {
+  const socket = new PassThrough() as PassThrough & { __capturedResponse?: string };
+  const originalWrite = socket.write.bind(socket);
+  socket.__capturedResponse = "";
+  socket.write = ((chunk: any, encoding?: any, callback?: any) => {
+    socket.__capturedResponse += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    return originalWrite(chunk, encoding, callback);
+  }) as typeof socket.write;
+
+  const beforeAcceptedCount = acceptedSockets.length;
+  server.emit(
+    "upgrade",
+    {
+      url,
+      headers: {},
+      socket: {
+        remoteAddress
+      }
+    } as any,
+    socket as any,
+    Buffer.alloc(0)
+  );
+
+  const rejectionStatus = parseUpgradeStatus(socket.__capturedResponse ?? "");
+  if (rejectionStatus !== undefined) {
+    return { statusCode: rejectionStatus };
+  }
+
+  if (acceptedSockets.length > beforeAcceptedCount) {
+    return {
+      statusCode: 101,
+      socket: acceptedSockets[acceptedSockets.length - 1]
+    };
+  }
+
+  return { statusCode: 0 };
+}
+
+function assertConnectedMessage(ws: InMemoryWebSocket, expectedAgentId: string) {
+  const connectedMessageRaw = ws.sentMessages.find((raw) => {
+    try {
+      const payload = JSON.parse(raw) as { type?: string };
+      return payload.type === "connected";
+    } catch {
+      return false;
+    }
+  });
+
+  assert.ok(connectedMessageRaw, "connected event should be sent after successful websocket upgrade");
+  const message = JSON.parse(connectedMessageRaw) as { type?: string; agent_id?: string | null };
+  assert.equal(message.type, "connected", "expected websocket connected event");
+  assert.equal(message.agent_id, expectedAgentId, "connected event should include authenticated agent id");
+}
+
+async function runWsHardeningWithoutListen(
+  server: ReturnType<typeof createServer> extends Promise<infer T> ? T["server"] : never,
+  token: string,
+  agentId: string
+): Promise<string> {
+  const acceptedSockets: InMemoryWebSocket[] = [];
+  const originalHandleUpgrade = WebSocketServer.prototype.handleUpgrade;
+
+  WebSocketServer.prototype.handleUpgrade = function mockHandleUpgrade(request, _socket, _head, callback) {
+    const parsedUrl = new URL(request.url ?? "", "http://localhost");
+    const autoPong = parsedUrl.searchParams.get("autoPong") !== "false";
+    const ws = new InMemoryWebSocket(autoPong);
+
+    (this.clients as Set<InMemoryWebSocket>).add(ws);
+    ws.once("close", () => {
+      (this.clients as Set<InMemoryWebSocket>).delete(ws);
+    });
+    acceptedSockets.push(ws);
+    callback(ws as unknown as WebSocket, request);
+  };
+
+  try {
+    const baseWsPath = "/ws";
+    const unauthStatus = probeInMemoryUpgrade(server, baseWsPath, acceptedSockets).statusCode;
+    assert.equal(unauthStatus, 401, "missing websocket token should return 401");
+
+    const rejectedStatuses = Array.from({ length: 8 }, (_unused, index) =>
+      probeInMemoryUpgrade(server, `${baseWsPath}?token=invalid-token-${index}`, acceptedSockets).statusCode
+    );
+    assert.ok(
+      rejectedStatuses.every((statusCode) => statusCode === 401 || statusCode === 403),
+      "invalid token burst should only return unauthorized/forbidden statuses"
+    );
+
+    const authedWsPath = `${baseWsPath}?token=${encodeURIComponent(token)}`;
+    const acceptedOne = probeInMemoryUpgrade(server, authedWsPath, acceptedSockets);
+    const acceptedTwo = probeInMemoryUpgrade(server, authedWsPath, acceptedSockets);
+    assert.equal(acceptedOne.statusCode, 101, "authenticated websocket should upgrade");
+    assert.equal(acceptedTwo.statusCode, 101, "authenticated websocket should upgrade");
+    assert.ok(acceptedOne.socket, "authenticated websocket should include accepted socket");
+    assert.ok(acceptedTwo.socket, "authenticated websocket should include accepted socket");
+    assertConnectedMessage(acceptedOne.socket, agentId);
+    assertConnectedMessage(acceptedTwo.socket, agentId);
+    acceptedOne.socket.close();
+    acceptedTwo.socket.close();
+
+    const connectionA = probeInMemoryUpgrade(server, authedWsPath, acceptedSockets).socket;
+    const connectionB = probeInMemoryUpgrade(server, authedWsPath, acceptedSockets).socket;
+    assert.ok(connectionA, "first concurrent websocket should be accepted");
+    assert.ok(connectionB, "second concurrent websocket should be accepted");
+
+    const connectionCapStatus = probeInMemoryUpgrade(server, authedWsPath, acceptedSockets).statusCode;
+    assert.equal(connectionCapStatus, 403, "third concurrent websocket for same agent should be rejected by cap");
+
+    connectionA.close();
+    connectionB.close();
+
+    const zombieSocket = probeInMemoryUpgrade(server, `${authedWsPath}&autoPong=false`, acceptedSockets).socket;
+    assert.ok(zombieSocket, "zombie websocket should be accepted before heartbeat timeout");
+    await waitForWebSocketClose(zombieSocket as unknown as WebSocket, 3000);
+
+    const rateLimitedStatuses = Array.from({ length: 20 }, (_unused, index) =>
+      probeInMemoryUpgrade(server, `${baseWsPath}?token=invalid-rate-limit-${index}`, acceptedSockets).statusCode
+    );
+    assert.ok(
+      rateLimitedStatuses.some((statusCode) => statusCode === 429),
+      "upgrade burst should trigger websocket upgrade rate limiting"
+    );
+
+    return "websocket hardening validated via in-memory upgrade simulation (no listen permissions)";
+  } finally {
+    WebSocketServer.prototype.handleUpgrade = originalHandleUpgrade;
+    for (const ws of acceptedSockets) {
+      ws.close();
+    }
+  }
 }
 
 export async function runIntegrationGate(options: { quiet?: boolean } = {}): Promise<IntegrationGateSummary> {
@@ -421,7 +611,7 @@ export async function runIntegrationGate(options: { quiet?: boolean } = {}): Pro
             payload: {
               name: "Integration Agent",
               capability_tags: ["analysis", "delivery"],
-              initial_lingshi: 10
+              initial_lingshi: 150
             }
           });
 
@@ -435,6 +625,27 @@ export async function runIntegrationGate(options: { quiet?: boolean } = {}): Pro
 
           state.agentId = agentId;
           state.token = token;
+
+          const scorerResponse = await app.inject({
+            method: "POST",
+            url: "/api/agents/register",
+            payload: {
+              name: "Integration Scorer",
+              capability_tags: ["review"],
+              initial_lingshi: 10
+            }
+          });
+
+          assert.equal(scorerResponse.statusCode, 201, "scorer registration should return 201");
+          const scorerPayload = parseJsonBody<ApiEnvelope<AgentRegisterResponse>>(scorerResponse.body);
+          const scorerId = scorerPayload.data.agent.agent_id;
+          const scorerToken = scorerPayload.data.token;
+
+          assert.ok(scorerId, "scorer id should be present");
+          assert.ok(scorerToken, "scorer token should be present");
+
+          state.scorerId = scorerId;
+          state.scorerToken = scorerToken;
 
           const pingResponse = await app.inject({
             method: "PUT",
@@ -453,14 +664,19 @@ export async function runIntegrationGate(options: { quiet?: boolean } = {}): Pro
         run: async () => {
           assert.ok(state.agentId, "agent id must be initialized before task lifecycle check");
           assert.ok(state.token, "token must be initialized before task lifecycle check");
+          assert.ok(state.scorerToken, "scorer token must be initialized before task lifecycle check");
 
           const authHeader = {
             authorization: `Bearer ${state.token}`
+          };
+          const scorerAuthHeader = {
+            authorization: `Bearer ${state.scorerToken}`
           };
 
           const createTaskResponse = await app.inject({
             method: "POST",
             url: "/api/tasks",
+            headers: authHeader,
             payload: {
               title: "Integration lifecycle task",
               description: "Lifecycle matrix coverage",
@@ -537,7 +753,7 @@ export async function runIntegrationGate(options: { quiet?: boolean } = {}): Pro
           const scoreResponse = await app.inject({
             method: "POST",
             url: `/api/tasks/${state.taskId}/score`,
-            headers: authHeader,
+            headers: scorerAuthHeader,
             payload: {
               quality: 92,
               speed: 88,
@@ -562,7 +778,7 @@ export async function runIntegrationGate(options: { quiet?: boolean } = {}): Pro
           assert.equal(settleResponse.statusCode, 200, "task settlement should return 200");
           const settlePayload = parseJsonBody<ApiEnvelope<SettlementResponse>>(settleResponse.body);
           assert.equal(settlePayload.data.settlement.agent_id, state.agentId, "settlement should pay the assigned agent");
-          assert.equal(settlePayload.data.settlement.amount, 108, "settlement amount should match score-weighted payout");
+          assert.equal(settlePayload.data.settlement.amount, 107.04, "settlement amount should match score-weighted payout");
           assert.equal(settlePayload.data.settlement.reason, "task_settlement", "settlement reason should match request");
           assert.match(
             settlePayload.data.settlement.idempotency_key,
@@ -715,10 +931,18 @@ export async function runIntegrationGate(options: { quiet?: boolean } = {}): Pro
           assert.ok(state.token, "token must be initialized before websocket hardening check");
           assert.ok(state.agentId, "agent id must be initialized before websocket hardening check");
 
-          await app.listen({
-            host: "127.0.0.1",
-            port: 0
-          });
+          try {
+            await app.listen({
+              host: "127.0.0.1",
+              port: 0
+            });
+          } catch (error) {
+            if (error instanceof Error && /listen\s+(EPERM|EACCES)/.test(error.message)) {
+              return runWsHardeningWithoutListen(app.server, state.token, state.agentId);
+            }
+
+            throw error;
+          }
 
           const address = app.server.address();
 

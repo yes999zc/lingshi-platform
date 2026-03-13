@@ -10,8 +10,13 @@ import {
   resolveRateLimitMaxTrackedKeysFromEnv,
   resolveRateLimitPerMinuteFromEnv
 } from "./middleware/rate-limit";
+import { createBidRepository } from "../db/bid-repository";
+import { createSubmissionRepository } from "../db/submission-repository";
 import { EXPECTED_INDEX_CREATE_SQL } from "../db/expected-indexes";
+import { computeScore, validateScorerIsolation } from "../engine/scoring";
 import { TASK_STATES, validateTaskTransition } from "../engine/task-state";
+import { getRuleEngine } from "../engine/rule-engine";
+import { getTierBidWeight } from "../engine/tier-manager";
 
 const VALID_TASK_STATUSES = new Set<string>([...TASK_STATES, "cancelled"]);
 const DEFAULT_SETTLEMENT_REASON = "task_settlement";
@@ -33,6 +38,8 @@ interface TaskRow {
   status: string;
   agent_id: string | null;
   assigned_bid_id: string | null;
+  bidding_started_at: string | null;
+  bidding_ends_at: string | null;
   submission_payload: string | null;
   submitted_at: string | null;
   score_quality: number | null;
@@ -69,7 +76,12 @@ interface BidRow {
   confidence: number;
   estimated_cycles: number;
   bid_stake: number;
+  escrow_amount: number;
   created_at: string;
+}
+
+interface BidWithTierRow extends BidRow {
+  agent_tier: string;
 }
 
 interface BidResponse {
@@ -79,6 +91,7 @@ interface BidResponse {
   confidence: number;
   estimated_cycles: number;
   bid_stake: number;
+  escrow_amount: number;
   created_at: string;
 }
 
@@ -178,8 +191,10 @@ interface ValidSettleTaskPayload {
   amount?: number;
 }
 
-interface AgentIdRow {
+interface AgentProfileRow {
   agent_id: string;
+  lingshi_balance: number;
+  tier: string;
 }
 
 interface OpenBidCountRow {
@@ -463,10 +478,6 @@ function validateAssignTaskBody(body: unknown): { value?: ValidAssignTaskPayload
   const bidId = normalizeOptionalString(payload.bid_id, "bid_id", issues, 128);
   const agentId = normalizeOptionalString(payload.agent_id, "agent_id", issues, 128);
 
-  if (!bidId && !agentId) {
-    issues.push({ field: "body", message: "either bid_id or agent_id is required" });
-  }
-
   if (issues.length > 0) {
     return { issues };
   }
@@ -631,6 +642,26 @@ function parseJsonPayload(raw: string | null): unknown {
   }
 }
 
+function normalizeTierName(raw: string | null | undefined): "Outer" | "Core" | "Elder" {
+  if (!raw) {
+    return "Outer";
+  }
+
+  const normalized = raw.trim();
+
+  if (!normalized) {
+    return "Outer";
+  }
+
+  const canonical = normalized[0]?.toUpperCase() + normalized.slice(1).toLowerCase();
+
+  if (canonical === "Core" || canonical === "Elder" || canonical === "Outer") {
+    return canonical as "Outer" | "Core" | "Elder";
+  }
+
+  return "Outer";
+}
+
 function roundToTwo(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
@@ -720,6 +751,7 @@ function toBidResponse(row: BidRow): BidResponse {
     confidence: row.confidence,
     estimated_cycles: row.estimated_cycles,
     bid_stake: row.bid_stake,
+    escrow_amount: row.escrow_amount,
     created_at: row.created_at
   };
 }
@@ -772,6 +804,14 @@ function ensureTaskSchema(db: Database.Database) {
     db.exec("ALTER TABLE tasks ADD COLUMN assigned_bid_id TEXT");
   }
 
+  if (!taskColumns.has("bidding_started_at")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN bidding_started_at TEXT");
+  }
+
+  if (!taskColumns.has("bidding_ends_at")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN bidding_ends_at TEXT");
+  }
+
   if (!taskColumns.has("submission_payload")) {
     db.exec("ALTER TABLE tasks ADD COLUMN submission_payload TEXT");
   }
@@ -820,6 +860,10 @@ function ensureTaskSchema(db: Database.Database) {
     db.exec("ALTER TABLE bids ADD COLUMN bid_stake REAL NOT NULL DEFAULT 0");
   }
 
+  if (!bidColumns.has("escrow_amount")) {
+    db.exec("ALTER TABLE bids ADD COLUMN escrow_amount REAL NOT NULL DEFAULT 0");
+  }
+
   if (!ledgerColumns.has("task_id")) {
     db.exec("ALTER TABLE ledger ADD COLUMN task_id TEXT");
   }
@@ -836,6 +880,20 @@ function ensureTaskSchema(db: Database.Database) {
     db.exec("ALTER TABLE ledger ADD COLUMN idempotency_key TEXT");
   }
 
+  // Ensure UNIQUE constraint on bids(task_id, agent_id) for AC-SM-06
+  const bidIndexes = db.prepare("PRAGMA index_list(bids)").all() as Array<{ name: string; unique: number }>;
+  const hasUniqueTaskAgent = bidIndexes.some((idx) => {
+    if (idx.unique !== 1) return false;
+    const cols = db.prepare(`PRAGMA index_info(${idx.name})`).all() as Array<{ name: string }>;
+    const colNames = cols.map((c) => c.name).sort();
+    return colNames.length === 2 && colNames[0] === "agent_id" && colNames[1] === "task_id";
+  });
+
+  if (!hasUniqueTaskAgent) {
+    // Create unique index on (task_id, agent_id) to prevent duplicate bids from same agent
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_bids_task_agent_unique ON bids (task_id, agent_id)");
+  }
+
   for (const createIndexSql of EXPECTED_INDEX_CREATE_SQL) {
     db.exec(createIndexSql);
   }
@@ -844,12 +902,20 @@ function ensureTaskSchema(db: Database.Database) {
 const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) => {
   const { db } = options;
   const publishEvent = options.publishEvent ?? (() => undefined);
-  const openBidCap = parsePositiveInteger(process.env.AGENT_OPEN_BID_CAP, DEFAULT_AGENT_OPEN_BID_CAP);
+  const rules = getRuleEngine().getConfig();
+  const openBidCap =
+    rules.task.max_concurrent_open_tasks_per_agent ?? parsePositiveInteger(process.env.AGENT_OPEN_BID_CAP, DEFAULT_AGENT_OPEN_BID_CAP);
+  const bidWindowSeconds = Math.min(rules.task.bid_window_seconds, rules.task.max_bid_window_seconds);
+  const minBidAmount = rules.bidding.min_bid_amount_lingshi;
+  const bidEscrowPct = rules.bidding.bid_escrow_pct;
+  const maxSubmissionBytes = rules.task.max_submission_size_bytes;
   const authMiddleware = createAgentAuthMiddleware(db);
   const rateLimitMiddleware = createAgentRateLimitMiddleware({
     maxRequestsPerMinute: resolveRateLimitPerMinuteFromEnv(),
     maxTrackedKeys: resolveRateLimitMaxTrackedKeysFromEnv()
   });
+  const bidRepository = createBidRepository(db);
+  const submissionRepository = createSubmissionRepository(db);
 
   ensureTaskSchema(db);
 
@@ -861,6 +927,8 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       status,
       agent_id,
       assigned_bid_id,
+      bidding_started_at,
+      bidding_ends_at,
       submission_payload,
       submitted_at,
       score_quality,
@@ -921,6 +989,8 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
   const markTaskBiddingQuery = db.prepare(`
     UPDATE tasks
     SET status = @status,
+        bidding_started_at = @bidding_started_at,
+        bidding_ends_at = @bidding_ends_at,
         updated_at = @updated_at
     WHERE id = @id
       AND status = @current_status
@@ -970,7 +1040,13 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
   `);
 
   const getAgentByIdQuery = db.prepare(`
-    SELECT agent_id
+    SELECT agent_id, lingshi_balance, tier
+    FROM agents
+    WHERE agent_id = ?
+  `);
+
+  const getAgentBalanceQuery = db.prepare(`
+    SELECT agent_id, lingshi_balance, tier
     FROM agents
     WHERE agent_id = ?
   `);
@@ -980,6 +1056,14 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     SET lingshi_balance = lingshi_balance + @amount,
         updated_at = @updated_at
     WHERE agent_id = @agent_id
+  `);
+
+  const debitAgentBalanceQuery = db.prepare(`
+    UPDATE agents
+    SET lingshi_balance = lingshi_balance - @amount,
+        updated_at = @updated_at
+    WHERE agent_id = @agent_id
+      AND lingshi_balance >= @amount
   `);
 
   const insertBidQuery = db.prepare(`
@@ -992,6 +1076,7 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       confidence,
       estimated_cycles,
       bid_stake,
+      escrow_amount,
       created_at
     ) VALUES (
       @id,
@@ -1002,30 +1087,53 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       @confidence,
       @estimated_cycles,
       @bid_stake,
+      @escrow_amount,
       @created_at
     )
   `);
 
   const getBidByIdQuery = db.prepare(`
-    SELECT id, task_id, agent_id, confidence, estimated_cycles, bid_stake, created_at
+    SELECT id, task_id, agent_id, confidence, estimated_cycles, bid_stake, escrow_amount, created_at
     FROM bids
     WHERE id = ?
   `);
 
   const getBidByTaskAndIdQuery = db.prepare(`
-    SELECT id, task_id, agent_id, confidence, estimated_cycles, bid_stake, created_at
+    SELECT id, task_id, agent_id, confidence, estimated_cycles, bid_stake, escrow_amount, created_at
     FROM bids
     WHERE task_id = @task_id
       AND id = @id
   `);
 
   const getBidByTaskAndAgentQuery = db.prepare(`
-    SELECT id, task_id, agent_id, confidence, estimated_cycles, bid_stake, created_at
+    SELECT id, task_id, agent_id, confidence, estimated_cycles, bid_stake, escrow_amount, created_at
     FROM bids
     WHERE task_id = @task_id
       AND agent_id = @agent_id
     ORDER BY confidence DESC, created_at ASC
     LIMIT 1
+  `);
+
+  const deleteBidByTaskAndIdAndAgentQuery = db.prepare(`
+    DELETE FROM bids
+    WHERE task_id = @task_id
+      AND id = @id
+      AND agent_id = @agent_id
+  `);
+
+  const listBidsWithTierByTaskQuery = db.prepare(`
+    SELECT bids.id,
+           bids.task_id,
+           bids.agent_id,
+           bids.confidence,
+           bids.estimated_cycles,
+           bids.bid_stake,
+           bids.escrow_amount,
+           bids.created_at,
+           agents.tier AS agent_tier
+    FROM bids
+    INNER JOIN agents ON agents.agent_id = bids.agent_id
+    WHERE bids.task_id = ?
   `);
 
   const countOpenBidsByAgentQuery = db.prepare(`
@@ -1088,9 +1196,17 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
   type PlaceBidResult =
     | { type: "task_not_found" }
     | { type: "agent_not_found" }
+    | { type: "bid_window_closed"; biddingEndedAt: string }
+    | { type: "insufficient_balance"; agentId: string; escrowAmount: number; balance: number }
     | { type: "bid_cap_exceeded"; openBidCount: number; cap: number }
+    | { type: "duplicate_bid"; existingBid: BidResponse }
     | { type: "status_conflict"; conflict: StatusConflictResult }
-    | { type: "ok"; bid: BidResponse; task: TaskResponse };
+    | { type: "ok"; bid: BidResponse; task: TaskResponse; previousStatus: string; statusChanged: boolean };
+
+  type CreateTaskResult =
+    | { type: "agent_not_found"; agentId: string }
+    | { type: "insufficient_balance"; agentId: string; requiredAmount: number; balance: number }
+    | { type: "ok"; task: TaskResponse; posterAgentId: string; escrowAmount: number };
 
   type AssignTaskResult =
     | { type: "task_not_found" }
@@ -1098,19 +1214,27 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     | { type: "agent_not_found" }
     | { type: "assignment_mismatch"; bidAgentId: string; requestedAgentId: string }
     | { type: "status_conflict"; conflict: StatusConflictResult }
-    | { type: "ok"; task: TaskResponse; assignedBid: BidResponse; assignedAt: string };
+    | {
+        type: "ok";
+        task: TaskResponse;
+        assignedBid: BidResponse;
+        assignedAt: string;
+        previousStatus: string;
+        refundedEscrows: Array<{ agentId: string; amount: number; bidId: string }>;
+      };
 
   type SubmitTaskResult =
     | { type: "task_not_found" }
     | { type: "assignee_missing" }
     | { type: "forbidden_agent"; expectedAgentId: string; requestedAgentId: string }
     | { type: "status_conflict"; conflict: StatusConflictResult }
-    | { type: "ok"; task: TaskResponse; submittedAt: string; submitterAgentId: string; result: unknown };
+    | { type: "ok"; task: TaskResponse; submittedAt: string; submitterAgentId: string; result: unknown; previousStatus: string };
 
   type ScoreTaskResult =
     | { type: "task_not_found" }
     | { type: "assignee_missing" }
     | { type: "status_conflict"; conflict: StatusConflictResult }
+    | { type: "scorer_not_allowed"; reason: string }
     | {
         type: "ok";
         task: TaskResponse;
@@ -1119,6 +1243,21 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         speed: number;
         innovation: number;
         finalScore: number;
+        scorerAgentId: string;
+        previousStatus: string;
+      };
+
+  type WithdrawBidResult =
+    | { type: "task_not_found" }
+    | { type: "bid_not_found" }
+    | { type: "forbidden_agent"; expectedAgentId: string; requestedAgentId: string }
+    | { type: "status_conflict"; conflict: StatusConflictResult }
+    | {
+        type: "ok";
+        task: TaskResponse;
+        bid: BidResponse;
+        refundedEscrowAmount: number;
+        withdrawnAt: string;
       };
 
   type SettleTaskResult =
@@ -1137,6 +1276,7 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         reason: string;
         idempotencyKey: string;
         ledger: LedgerRow;
+        previousStatus: string;
       };
 
   const findDuplicateSettlementLedger = (
@@ -1190,10 +1330,23 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       return { type: "task_not_found" } as PlaceBidResult;
     }
 
-    const agentRow = getAgentByIdQuery.get(payload.agentId) as AgentIdRow | undefined;
+    const previousStatus = taskRow.status;
+    let statusChanged = false;
+
+    const agentRow = getAgentBalanceQuery.get(payload.agentId) as AgentProfileRow | undefined;
 
     if (!agentRow) {
       return { type: "agent_not_found" } as PlaceBidResult;
+    }
+
+    if (taskRow.status === "bidding" && taskRow.bidding_ends_at) {
+      const biddingEndsAtMs = Date.parse(taskRow.bidding_ends_at);
+      if (Number.isFinite(biddingEndsAtMs) && Date.parse(payload.now) > biddingEndsAtMs) {
+        return {
+          type: "bid_window_closed",
+          biddingEndedAt: taskRow.bidding_ends_at
+        } as PlaceBidResult;
+      }
     }
 
     const openBidCountRow = countOpenBidsByAgentQuery.get(payload.agentId) as OpenBidCountRow | undefined;
@@ -1204,6 +1357,35 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         type: "bid_cap_exceeded",
         openBidCount,
         cap: openBidCap
+      } as PlaceBidResult;
+    }
+
+    // AC-SM-06: exactly one bid per agent per task — return 409 if already bid
+    const existingBidRow = getBidByTaskAndAgentQuery.get({ task_id: payload.taskId, agent_id: payload.agentId }) as BidRow | undefined;
+    if (existingBidRow) {
+      return {
+        type: "duplicate_bid",
+        existingBid: {
+          id: existingBidRow.id,
+          task_id: existingBidRow.task_id,
+          agent_id: existingBidRow.agent_id,
+          confidence: existingBidRow.confidence,
+          estimated_cycles: existingBidRow.estimated_cycles,
+          bid_stake: existingBidRow.bid_stake,
+          escrow_amount: existingBidRow.escrow_amount,
+          created_at: existingBidRow.created_at
+        }
+      } as PlaceBidResult;
+    }
+
+    const escrowAmount = roundToTwo(payload.bidStake * (bidEscrowPct / 100));
+
+    if (escrowAmount > 0 && agentRow.lingshi_balance < escrowAmount) {
+      return {
+        type: "insufficient_balance",
+        agentId: agentRow.agent_id,
+        escrowAmount,
+        balance: agentRow.lingshi_balance
       } as PlaceBidResult;
     }
 
@@ -1227,6 +1409,8 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         id: payload.taskId,
         status: transition.to,
         current_status: transition.from,
+        bidding_started_at: payload.now,
+        bidding_ends_at: new Date(Date.parse(payload.now) + bidWindowSeconds * 1000).toISOString(),
         updated_at: payload.now
       });
 
@@ -1243,6 +1427,8 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
           } as PlaceBidResult;
         }
       }
+
+      statusChanged = true;
     }
 
     insertBidQuery.run({
@@ -1254,8 +1440,45 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       confidence: payload.confidence,
       estimated_cycles: payload.estimatedCycles,
       bid_stake: payload.bidStake,
+      escrow_amount: escrowAmount,
       created_at: payload.now
     });
+
+    if (escrowAmount > 0) {
+      const ledgerId = randomUUID();
+      const debitResult = debitAgentBalanceQuery.run({
+        amount: escrowAmount,
+        updated_at: payload.now,
+        agent_id: payload.agentId
+      });
+
+      if (debitResult.changes === 0) {
+        return {
+          type: "insufficient_balance",
+          agentId: payload.agentId,
+          escrowAmount,
+          balance: agentRow.lingshi_balance
+        } as PlaceBidResult;
+      }
+
+      insertLedgerEntryQuery.run({
+        id: ledgerId,
+        entity_id: payload.agentId,
+        task_id: payload.taskId,
+        agent_id: payload.agentId,
+        reason: "bid_escrow",
+        idempotency_key: null,
+        entry_type: "bid_escrow",
+        amount: roundToTwo(-escrowAmount),
+        currency: "LSP",
+        note: JSON.stringify({
+          task_id: payload.taskId,
+          bid_id: payload.bidId,
+          escrow_amount: escrowAmount
+        }),
+        created_at: payload.now
+      });
+    }
 
     const bidRow = getBidByIdQuery.get(payload.bidId) as BidRow | undefined;
     const refreshedTaskRow = getTaskByIdQuery.get(payload.taskId) as TaskRow | undefined;
@@ -1267,9 +1490,97 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     return {
       type: "ok",
       bid: toBidResponse(bidRow),
-      task: toTaskResponse(refreshedTaskRow)
+      task: toTaskResponse(refreshedTaskRow),
+      previousStatus,
+      statusChanged
     } as PlaceBidResult;
   });
+
+  const createTask = db.transaction(
+    (payload: ValidCreateTaskPayload & { taskId: string; now: string; posterAgentId: string }) => {
+      const poster = getAgentBalanceQuery.get(payload.posterAgentId) as AgentProfileRow | undefined;
+
+      if (!poster) {
+        return {
+          type: "agent_not_found",
+          agentId: payload.posterAgentId
+        } as CreateTaskResult;
+      }
+
+      const escrowAmount = roundToTwo(payload.bountyLingshi);
+
+      if (escrowAmount > 0 && poster.lingshi_balance < escrowAmount) {
+        return {
+          type: "insufficient_balance",
+          agentId: payload.posterAgentId,
+          requiredAmount: escrowAmount,
+          balance: poster.lingshi_balance
+        } as CreateTaskResult;
+      }
+
+      if (escrowAmount > 0) {
+        const debitResult = debitAgentBalanceQuery.run({
+          amount: escrowAmount,
+          updated_at: payload.now,
+          agent_id: payload.posterAgentId
+        });
+
+        if (debitResult.changes === 0) {
+          return {
+            type: "insufficient_balance",
+            agentId: payload.posterAgentId,
+            requiredAmount: escrowAmount,
+            balance: poster.lingshi_balance
+          } as CreateTaskResult;
+        }
+      }
+
+      insertTaskQuery.run({
+        id: payload.taskId,
+        title: payload.title,
+        description: payload.description,
+        status: "open",
+        complexity: payload.complexity,
+        bounty_lingshi: payload.bountyLingshi,
+        required_tags: JSON.stringify(payload.requiredTags),
+        created_at: payload.now,
+        updated_at: payload.now
+      });
+
+      if (escrowAmount > 0) {
+        insertLedgerEntryQuery.run({
+          id: randomUUID(),
+          entity_id: payload.posterAgentId,
+          task_id: payload.taskId,
+          agent_id: payload.posterAgentId,
+          reason: "task_escrow",
+          idempotency_key: null,
+          entry_type: "task_escrow",
+          amount: roundToTwo(-escrowAmount),
+          currency: "LSP",
+          note: JSON.stringify({
+            task_id: payload.taskId,
+            poster_agent_id: payload.posterAgentId,
+            escrow_amount: escrowAmount
+          }),
+          created_at: payload.now
+        });
+      }
+
+      const taskRow = getTaskByIdQuery.get(payload.taskId) as TaskRow | undefined;
+
+      if (!taskRow) {
+        throw new Error("Task creation succeeded but reloading persisted row failed");
+      }
+
+      return {
+        type: "ok",
+        task: toTaskResponse(taskRow),
+        posterAgentId: payload.posterAgentId,
+        escrowAmount
+      } as CreateTaskResult;
+    }
+  );
 
   const assignTask = db.transaction(
     (payload: ValidAssignTaskPayload & { taskId: string; now: string }) => {
@@ -1278,6 +1589,8 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       if (!taskRow) {
         return { type: "task_not_found" } as AssignTaskResult;
       }
+
+      const previousStatus = taskRow.status;
 
       const transition = validateTaskTransition(taskRow.status, "assigned");
 
@@ -1306,6 +1619,36 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
           task_id: payload.taskId,
           agent_id: payload.agentId
         }) as BidRow | undefined;
+      } else {
+        const candidateRows = listBidsWithTierByTaskQuery.all(payload.taskId) as BidWithTierRow[];
+
+        if (candidateRows.length > 0) {
+          const ranked = candidateRows
+            .map((bid) => {
+              const tierName = normalizeTierName(bid.agent_tier);
+              const weight = getTierBidWeight(tierName);
+              const weightedBid = roundToTwo(bid.bid_stake * weight);
+              return {
+                bid,
+                weightedBid,
+                weight
+              };
+            })
+            .sort((a, b) => {
+              if (b.weightedBid !== a.weightedBid) {
+                return b.weightedBid - a.weightedBid;
+              }
+              if (b.bid.bid_stake !== a.bid.bid_stake) {
+                return b.bid.bid_stake - a.bid.bid_stake;
+              }
+              if (b.bid.confidence !== a.bid.confidence) {
+                return b.bid.confidence - a.bid.confidence;
+              }
+              return a.bid.created_at.localeCompare(b.bid.created_at);
+            });
+
+          assignedBidRow = ranked[0]?.bid;
+        }
       }
 
       if (!assignedBidRow) {
@@ -1320,7 +1663,7 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         } as AssignTaskResult;
       }
 
-      const agentRow = getAgentByIdQuery.get(assignedBidRow.agent_id) as AgentIdRow | undefined;
+      const agentRow = getAgentByIdQuery.get(assignedBidRow.agent_id) as AgentProfileRow | undefined;
 
       if (!agentRow) {
         return { type: "agent_not_found" } as AssignTaskResult;
@@ -1351,22 +1694,149 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         throw new Error("Task assignment succeeded but reloading task failed");
       }
 
+      const refundedEscrows: Array<{ agentId: string; amount: number; bidId: string }> = [];
+      const allBids = listBidsWithTierByTaskQuery.all(payload.taskId) as BidWithTierRow[];
+
+      for (const bid of allBids) {
+        if (bid.id === assignedBidRow.id) {
+          continue;
+        }
+
+        if (bid.escrow_amount > 0) {
+          creditAgentBalanceQuery.run({
+            amount: bid.escrow_amount,
+            updated_at: payload.now,
+            agent_id: bid.agent_id
+          });
+
+          refundedEscrows.push({
+            agentId: bid.agent_id,
+            amount: bid.escrow_amount,
+            bidId: bid.id
+          });
+
+          insertLedgerEntryQuery.run({
+            id: randomUUID(),
+            entity_id: bid.agent_id,
+            task_id: payload.taskId,
+            agent_id: bid.agent_id,
+            reason: "bid_refund",
+            idempotency_key: null,
+            entry_type: "bid_refund",
+            amount: roundToTwo(bid.escrow_amount),
+            currency: "LSP",
+            note: JSON.stringify({
+              task_id: payload.taskId,
+              bid_id: bid.id,
+              escrow_amount: bid.escrow_amount
+            }),
+            created_at: payload.now
+          });
+        }
+      }
+
       return {
         type: "ok",
         task: toTaskResponse(persistedTask),
         assignedBid: toBidResponse(assignedBidRow),
-        assignedAt: payload.now
+        assignedAt: payload.now,
+        previousStatus,
+        refundedEscrows
       } as AssignTaskResult;
     }
   );
 
+  const withdrawBid = db.transaction((payload: { taskId: string; bidId: string; agentId: string; now: string }) => {
+    const taskRow = getTaskByIdQuery.get(payload.taskId) as TaskRow | undefined;
+
+    if (!taskRow) {
+      return { type: "task_not_found" } as WithdrawBidResult;
+    }
+
+    if (taskRow.status !== "bidding") {
+      return {
+        type: "status_conflict",
+        conflict: toStatusConflict(taskRow.status, "bidding")
+      } as WithdrawBidResult;
+    }
+
+    const bidRow = getBidByTaskAndIdQuery.get({
+      task_id: payload.taskId,
+      id: payload.bidId
+    }) as BidRow | undefined;
+
+    if (!bidRow) {
+      return { type: "bid_not_found" } as WithdrawBidResult;
+    }
+
+    if (bidRow.agent_id !== payload.agentId) {
+      return {
+        type: "forbidden_agent",
+        expectedAgentId: bidRow.agent_id,
+        requestedAgentId: payload.agentId
+      } as WithdrawBidResult;
+    }
+
+    const deleteResult = deleteBidByTaskAndIdAndAgentQuery.run({
+      task_id: payload.taskId,
+      id: payload.bidId,
+      agent_id: payload.agentId
+    });
+
+    if (deleteResult.changes === 0) {
+      return { type: "bid_not_found" } as WithdrawBidResult;
+    }
+
+    if (bidRow.escrow_amount > 0) {
+      creditAgentBalanceQuery.run({
+        amount: bidRow.escrow_amount,
+        updated_at: payload.now,
+        agent_id: payload.agentId
+      });
+
+      insertLedgerEntryQuery.run({
+        id: randomUUID(),
+        entity_id: payload.agentId,
+        task_id: payload.taskId,
+        agent_id: payload.agentId,
+        reason: "bid_refund",
+        idempotency_key: null,
+        entry_type: "bid_refund",
+        amount: roundToTwo(bidRow.escrow_amount),
+        currency: "LSP",
+        note: JSON.stringify({
+          task_id: payload.taskId,
+          bid_id: payload.bidId,
+          escrow_amount: bidRow.escrow_amount
+        }),
+        created_at: payload.now
+      });
+    }
+
+    const persistedTask = getTaskByIdQuery.get(payload.taskId) as TaskRow | undefined;
+
+    if (!persistedTask) {
+      throw new Error("Bid withdrawal succeeded but task reload failed");
+    }
+
+    return {
+      type: "ok",
+      task: toTaskResponse(persistedTask),
+      bid: toBidResponse(bidRow),
+      refundedEscrowAmount: roundToTwo(Math.max(bidRow.escrow_amount, 0)),
+      withdrawnAt: payload.now
+    } as WithdrawBidResult;
+  });
+
   const submitTask = db.transaction(
-    (payload: ValidSubmitTaskPayload & { taskId: string; now: string }) => {
+    (payload: ValidSubmitTaskPayload & { taskId: string; now: string; submissionId: string; resultSizeBytes: number }) => {
       const taskRow = getTaskByIdQuery.get(payload.taskId) as TaskRow | undefined;
 
       if (!taskRow) {
         return { type: "task_not_found" } as SubmitTaskResult;
       }
+
+      const previousStatus = taskRow.status;
 
       const transition = validateTaskTransition(taskRow.status, "submitted");
 
@@ -1420,23 +1890,35 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         throw new Error("Task submission succeeded but reloading task failed");
       }
 
+      submissionRepository.insertSubmission({
+        id: payload.submissionId,
+        task_id: payload.taskId,
+        agent_id: taskRow.agent_id,
+        payload: payload.serializedResult,
+        size_bytes: payload.resultSizeBytes,
+        created_at: payload.now
+      });
+
       return {
         type: "ok",
         task: toTaskResponse(persistedTask),
         submittedAt: payload.now,
         submitterAgentId: taskRow.agent_id,
-        result: payload.result
+        result: payload.result,
+        previousStatus
       } as SubmitTaskResult;
     }
   );
 
   const scoreTask = db.transaction(
-    (payload: ValidScoreTaskPayload & { taskId: string; now: string }) => {
+    (payload: ValidScoreTaskPayload & { taskId: string; now: string; scorerAgentId: string }) => {
       const taskRow = getTaskByIdQuery.get(payload.taskId) as TaskRow | undefined;
 
       if (!taskRow) {
         return { type: "task_not_found" } as ScoreTaskResult;
       }
+
+      const previousStatus = taskRow.status;
 
       const transition = validateTaskTransition(taskRow.status, "scored");
 
@@ -1457,6 +1939,27 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         return { type: "assignee_missing" } as ScoreTaskResult;
       }
 
+      const bidderIds = bidRepository.listBidderIdsByTask(payload.taskId);
+      const isolationResult = validateScorerIsolation({
+        scorer_agent_id: payload.scorerAgentId,
+        task_poster_agent_id: taskRow.agent_id ?? "",
+        task_assignee_agent_id: taskRow.agent_id ?? "",
+        bidder_agent_ids: bidderIds
+      });
+
+      if (!isolationResult.allowed) {
+        return {
+          type: "scorer_not_allowed",
+          reason: isolationResult.reason ?? "Scorer is not allowed to score this task"
+        } as ScoreTaskResult;
+      }
+
+      const scoreResult = computeScore({
+        quality: payload.quality,
+        speed: payload.speed,
+        innovation: payload.innovation
+      });
+
       const updateResult = markTaskScoredQuery.run({
         id: payload.taskId,
         status: transition.to,
@@ -1464,7 +1967,7 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         score_quality: payload.quality,
         score_speed: payload.speed,
         score_innovation: payload.innovation,
-        final_score: payload.finalScore,
+        final_score: scoreResult.final_score,
         scored_at: payload.now,
         updated_at: payload.now
       });
@@ -1492,7 +1995,9 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         quality: payload.quality,
         speed: payload.speed,
         innovation: payload.innovation,
-        finalScore: payload.finalScore
+        finalScore: scoreResult.final_score,
+        scorerAgentId: payload.scorerAgentId,
+        previousStatus
       } as ScoreTaskResult;
     }
   );
@@ -1510,6 +2015,8 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       if (!taskRow) {
         return { type: "task_not_found" } as SettleTaskResult;
       }
+
+      const previousStatus = taskRow.status;
 
       const payoutAgentId = payload.agentId ?? taskRow.agent_id;
 
@@ -1557,7 +2064,7 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         } as SettleTaskResult;
       }
 
-      const payoutAgent = getAgentByIdQuery.get(payoutAgentId) as AgentIdRow | undefined;
+      const payoutAgent = getAgentByIdQuery.get(payoutAgentId) as AgentProfileRow | undefined;
 
       if (!payoutAgent) {
         return {
@@ -1569,6 +2076,11 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       const finalScore = taskRow.final_score ?? 0;
       const derivedAmount = roundToTwo(taskRow.bounty_lingshi * (finalScore / 100));
       const payoutAmount = payload.amount !== undefined ? payload.amount : derivedAmount;
+
+      // Get winning bid to refund escrow
+      const winningBid = taskRow.assigned_bid_id
+        ? (getBidByIdQuery.get(taskRow.assigned_bid_id) as BidRow | undefined)
+        : undefined;
 
       const taskUpdateResult = markTaskSettledQuery.run({
         id: payload.taskId,
@@ -1654,6 +2166,32 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         } as SettleTaskResult;
       }
 
+      // Refund winning bid escrow on successful settlement
+      if (winningBid && winningBid.escrow_amount > 0) {
+        creditAgentBalanceQuery.run({
+          amount: winningBid.escrow_amount,
+          updated_at: payload.now,
+          agent_id: payoutAgentId
+        });
+        insertLedgerEntryQuery.run({
+          id: randomUUID(),
+          entity_id: payoutAgentId,
+          task_id: payload.taskId,
+          agent_id: payoutAgentId,
+          reason: "bid_escrow_refund",
+          idempotency_key: null,
+          entry_type: "bid_refund",
+          amount: roundToTwo(winningBid.escrow_amount),
+          currency: "LSP",
+          note: JSON.stringify({
+            task_id: payload.taskId,
+            bid_id: winningBid.id,
+            escrow_amount: winningBid.escrow_amount
+          }),
+          created_at: payload.now
+        });
+      }
+
       const persistedTask = getTaskByIdQuery.get(payload.taskId) as TaskRow | undefined;
       const persistedLedger = getLedgerByIdQuery.get(payload.ledgerId) as LedgerRow | undefined;
 
@@ -1669,7 +2207,8 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         payoutAmount,
         reason: payload.reason,
         idempotencyKey,
-        ledger: persistedLedger
+        ledger: persistedLedger,
+        previousStatus
       } as SettleTaskResult;
     }
   );
@@ -1744,7 +2283,13 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     };
   });
 
-  app.post<{ Body: unknown }>("/tasks", async (request, reply) => {
+  app.post<{ Body: unknown }>("/tasks", { preHandler: protectedRoutePreHandlers }, async (request, reply) => {
+    const authenticatedAgentId = getAuthenticatedAgentId(request, reply);
+
+    if (!authenticatedAgentId) {
+      return;
+    }
+
     const validation = validateCreateTaskBody(request.body);
 
     if (!validation.value) {
@@ -1753,31 +2298,39 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
 
     const now = new Date().toISOString();
     const taskId = randomUUID();
-
-    insertTaskQuery.run({
-      id: taskId,
-      title: validation.value.title,
-      description: validation.value.description,
-      status: "open",
-      complexity: validation.value.complexity,
-      bounty_lingshi: validation.value.bountyLingshi,
-      required_tags: JSON.stringify(validation.value.requiredTags),
-      created_at: now,
-      updated_at: now
+    const result = createTask({
+      ...validation.value,
+      taskId,
+      now,
+      posterAgentId: authenticatedAgentId
     });
 
-    const row = getTaskByIdQuery.get(taskId) as TaskRow | undefined;
-
-    if (!row) {
-      return sendError(reply, 500, "TASK_CREATION_FAILED", "Task was created but could not be loaded", {
-        task_id: taskId
+    if (result.type === "agent_not_found") {
+      return sendError(reply, 404, "AGENT_NOT_FOUND", `Agent ${result.agentId} was not found`, {
+        agent_id: result.agentId
       });
     }
 
-    const task = toTaskResponse(row);
-    publishEvent("task.posted", {
+    if (result.type === "insufficient_balance") {
+      return sendError(
+        reply,
+        400,
+        "AGENT_INSUFFICIENT_BALANCE",
+        `Agent ${result.agentId} has insufficient balance to post task`,
+        {
+          agent_id: result.agentId,
+          required_amount: result.requiredAmount,
+          balance: result.balance
+        }
+      );
+    }
+
+    const task = result.task;
+    publishEvent("task.created", {
       task_id: task.id,
       status: task.status,
+      poster_agent_id: result.posterAgentId,
+      escrow_amount: result.escrowAmount,
       created_at: task.created_at
     });
 
@@ -1814,6 +2367,15 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       return sendAgentForbidden(reply, authenticatedAgentId, validation.value.agentId, "agent_id");
     }
 
+    if (validation.value.bidStake < minBidAmount) {
+      return sendValidationError(reply, [
+        {
+          field: "bid_stake",
+          message: `bid_stake must be at least ${minBidAmount}`
+        }
+      ]);
+    }
+
     const result = placeBid({
       ...validation.value,
       taskId,
@@ -1833,6 +2395,33 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       });
     }
 
+    if (result.type === "bid_window_closed") {
+      return sendError(
+        reply,
+        409,
+        "TASK_BID_WINDOW_CLOSED",
+        `Bid window for task ${taskId} has closed`,
+        {
+          task_id: taskId,
+          bidding_ended_at: result.biddingEndedAt
+        }
+      );
+    }
+
+    if (result.type === "insufficient_balance") {
+      return sendError(
+        reply,
+        409,
+        "AGENT_INSUFFICIENT_BALANCE",
+        `Agent ${result.agentId} has insufficient balance for bid escrow`,
+        {
+          agent_id: result.agentId,
+          escrow_amount: result.escrowAmount,
+          balance: result.balance
+        }
+      );
+    }
+
     if (result.type === "bid_cap_exceeded") {
       return sendError(
         reply,
@@ -1847,18 +2436,21 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       );
     }
 
-    if (result.type === "status_conflict") {
-      publishEvent("task.bid_result", {
-        task_id: taskId,
-        agent_id: validation.value.agentId,
-        accepted: false,
-        current_status: result.conflict.status,
-        attempted_transition: {
-          from: result.conflict.from,
-          to: result.conflict.to
+    if (result.type === "duplicate_bid") {
+      return sendError(
+        reply,
+        409,
+        "BID_ALREADY_EXISTS",
+        `Agent ${validation.value.agentId} has already placed a bid on task ${taskId}`,
+        {
+          task_id: taskId,
+          agent_id: validation.value.agentId,
+          existing_bid_id: result.existingBid.id
         }
-      });
+      );
+    }
 
+    if (result.type === "status_conflict") {
       return sendError(
         reply,
         409,
@@ -1875,18 +2467,39 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       );
     }
 
-    publishEvent("task.bid_result", {
-      task_id: result.task.id,
-      bid_id: result.bid.id,
-      agent_id: result.bid.agent_id,
-      accepted: true,
-      task_status: result.task.status
+    const successfulBid = result as Extract<PlaceBidResult, { type: "ok" }>;
+
+    publishEvent("bid.placed", {
+      task_id: successfulBid.task.id,
+      bid_id: successfulBid.bid.id,
+      agent_id: successfulBid.bid.agent_id,
+      bid_amount: successfulBid.bid.bid_stake,
+      escrow_amount: successfulBid.bid.escrow_amount,
+      created_at: successfulBid.bid.created_at
     });
+
+    if (successfulBid.statusChanged) {
+      publishEvent("task.state_changed", {
+        task_id: successfulBid.task.id,
+        from: successfulBid.previousStatus,
+        to: successfulBid.task.status,
+        changed_at: successfulBid.task.updated_at
+      });
+    }
+
+    if (successfulBid.bid.escrow_amount > 0) {
+      publishEvent("lingshi.debited", {
+        agent_id: successfulBid.bid.agent_id,
+        task_id: successfulBid.task.id,
+        amount: successfulBid.bid.escrow_amount,
+        reason: "bid_escrow"
+      });
+    }
 
     return reply.code(201).send({
       data: {
-        bid: result.bid,
-        task: result.task
+        bid: successfulBid.bid,
+        task: successfulBid.task
       }
     });
   };
@@ -1896,6 +2509,80 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
     "/tasks/:id/bids",
     { preHandler: protectedRoutePreHandlers },
     createBidHandler
+  );
+
+  app.delete<{ Params: { id: string; bid_id: string } }>(
+    "/tasks/:id/bids/:bid_id",
+    { preHandler: protectedRoutePreHandlers },
+    async (request, reply) => {
+      const authenticatedAgentId = getAuthenticatedAgentId(request, reply);
+
+      if (!authenticatedAgentId) {
+        return;
+      }
+
+      const taskId = request.params.id.trim();
+      const bidId = request.params.bid_id.trim();
+
+      if (!taskId || !bidId) {
+        return sendValidationError(reply, [{ field: "id", message: "task id and bid id are required" }]);
+      }
+
+      const result = withdrawBid({
+        taskId,
+        bidId,
+        agentId: authenticatedAgentId,
+        now: new Date().toISOString()
+      });
+
+      if (result.type === "task_not_found") {
+        return sendError(reply, 404, "TASK_NOT_FOUND", `Task ${taskId} was not found`, {
+          task_id: taskId
+        });
+      }
+
+      if (result.type === "bid_not_found") {
+        return sendError(reply, 404, "TASK_BID_NOT_FOUND", `Bid ${bidId} was not found for task ${taskId}`, {
+          task_id: taskId,
+          bid_id: bidId
+        });
+      }
+
+      if (result.type === "forbidden_agent") {
+        return sendAgentForbidden(reply, result.expectedAgentId, result.requestedAgentId, "agent_id");
+      }
+
+      if (result.type === "status_conflict") {
+        return sendTaskStateConflict(reply, taskId, result.conflict);
+      }
+
+      publishEvent("bid.withdrawn", {
+        task_id: taskId,
+        bid_id: bidId,
+        agent_id: authenticatedAgentId,
+        withdrawn_at: result.withdrawnAt
+      });
+
+      if (result.refundedEscrowAmount > 0) {
+        publishEvent("lingshi.credited", {
+          agent_id: authenticatedAgentId,
+          task_id: taskId,
+          amount: result.refundedEscrowAmount,
+          reason: "bid_refund",
+          bid_id: bidId
+        });
+      }
+
+      return {
+        data: {
+          bid: result.bid,
+          task: result.task,
+          refund: {
+            escrow_amount: result.refundedEscrowAmount
+          }
+        }
+      };
+    }
   );
 
   app.post<{ Params: { id: string }; Body: unknown }>(
@@ -1926,7 +2613,6 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
 
       const result = assignTask({
         ...validation.value,
-        agentId: validation.value.agentId ?? authenticatedAgentId,
         taskId,
         now: new Date().toISOString()
       });
@@ -1958,13 +2644,30 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         return sendTaskStateConflict(reply, taskId, result.conflict);
       }
 
-      publishEvent("task.assigned", {
+      publishEvent("bid.won", {
         task_id: result.task.id,
         bid_id: result.assignedBid.id,
         agent_id: result.assignedBid.agent_id,
-        status: result.task.status,
+        bid_amount: result.assignedBid.bid_stake,
         assigned_at: result.assignedAt
       });
+
+      publishEvent("task.state_changed", {
+        task_id: result.task.id,
+        from: result.previousStatus,
+        to: result.task.status,
+        changed_at: result.assignedAt
+      });
+
+      for (const refund of result.refundedEscrows) {
+        publishEvent("lingshi.credited", {
+          agent_id: refund.agentId,
+          task_id: result.task.id,
+          amount: refund.amount,
+          reason: "bid_refund",
+          bid_id: refund.bidId
+        });
+      }
 
       return {
         data: {
@@ -2005,11 +2708,28 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         return sendAgentForbidden(reply, authenticatedAgentId, validation.value.agentId, "agent_id");
       }
 
+      const resultSizeBytes = Buffer.byteLength(validation.value.serializedResult, "utf8");
+
+      if (resultSizeBytes > maxSubmissionBytes) {
+        return sendError(
+          reply,
+          413,
+          "TASK_SUBMISSION_TOO_LARGE",
+          `Submission exceeds max size of ${maxSubmissionBytes} bytes`,
+          {
+            max_size_bytes: maxSubmissionBytes,
+            size_bytes: resultSizeBytes
+          }
+        );
+      }
+
       const result = submitTask({
         ...validation.value,
         agentId: authenticatedAgentId,
         taskId,
-        now: new Date().toISOString()
+        now: new Date().toISOString(),
+        submissionId: randomUUID(),
+        resultSizeBytes
       });
 
       if (result.type === "task_not_found") {
@@ -2035,10 +2755,16 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         return sendTaskStateConflict(reply, taskId, result.conflict);
       }
 
-      publishEvent("task.submitted", {
+      publishEvent("task.state_changed", {
+        task_id: result.task.id,
+        from: result.previousStatus,
+        to: result.task.status,
+        changed_at: result.submittedAt
+      });
+
+      publishEvent("submission.received", {
         task_id: result.task.id,
         agent_id: result.submitterAgentId,
-        status: result.task.status,
         submitted_at: result.submittedAt
       });
 
@@ -2080,7 +2806,8 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
       const result = scoreTask({
         ...validation.value,
         taskId,
-        now: new Date().toISOString()
+        now: new Date().toISOString(),
+        scorerAgentId: authenticatedAgentId
       });
 
       if (result.type === "task_not_found") {
@@ -2099,14 +2826,27 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         return sendTaskStateConflict(reply, taskId, result.conflict);
       }
 
-      publishEvent("task.scored", {
+      if (result.type === "scorer_not_allowed") {
+        return sendError(reply, 403, "TASK_SCORER_FORBIDDEN", result.reason, {
+          task_id: taskId
+        });
+      }
+
+      publishEvent("score.submitted", {
         task_id: result.task.id,
-        status: result.task.status,
+        scorer_agent_id: result.scorerAgentId,
         scored_at: result.scoredAt,
         quality: result.quality,
         speed: result.speed,
         innovation: result.innovation,
         final_score: result.finalScore
+      });
+
+      publishEvent("task.state_changed", {
+        task_id: result.task.id,
+        from: result.previousStatus,
+        to: result.task.status,
+        changed_at: result.scoredAt
       });
 
       return {
@@ -2199,10 +2939,15 @@ const tasksRoutes: FastifyPluginAsync<TasksRouteOptions> = async (app, options) 
         return sendTaskStateConflict(reply, taskId, result.conflict);
       }
 
-      publishEvent("task.settled", {
+      publishEvent("task.state_changed", {
         task_id: result.task.id,
-        status: result.task.status,
-        settled_at: result.settledAt,
+        from: result.previousStatus,
+        to: result.task.status,
+        changed_at: result.settledAt
+      });
+
+      publishEvent("lingshi.credited", {
+        task_id: result.task.id,
         agent_id: result.payoutAgentId,
         amount: result.payoutAmount,
         reason: result.reason,

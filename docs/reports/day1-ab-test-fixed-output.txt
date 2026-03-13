@@ -1,0 +1,50 @@
+=== PUA vs 普通 Agent AB 测试开始 ===
+配置: 3 次/Agent, 间隔 5000ms
+服务地址: http://127.0.0.1:3000
+
+[0129cd31] SIMPLE Agent 运行 #1...
+[df53ca53] PUA Agent 运行 #1...
+[df53ca53] PUA ✅ 成功 501ms, 失败次数: 0
+[0129cd31] SIMPLE ✅ 成功 554ms, 失败次数: 0
+[b304d257] SIMPLE Agent 运行 #2...
+[00bc5187] PUA Agent 运行 #2...
+[b304d257] SIMPLE ✅ 成功 538ms, 失败次数: 0
+[00bc5187] PUA ✅ 成功 536ms, 失败次数: 0
+[d3a9b331] SIMPLE Agent 运行 #3...
+[6ad5a49e] PUA Agent 运行 #3...
+[d3a9b331] SIMPLE ✅ 成功 536ms, 失败次数: 0
+[6ad5a49e] PUA ✅ 成功 531ms, 失败次数: 0
+
+=== 所有测试完成 ===
+
+=== 汇总统计 ===
+普通 Agent: 3 次运行
+PUA Agent: 3 次运行
+
+📊 成功率:
+  普通 Agent: 100.0%
+  PUA Agent: 100.0%
+  差异: 0.0%
+
+📊 平均失败次数:
+  普通 Agent: 0.00
+  PUA Agent: 0.00
+  差异: 0.00
+
+📊 平均执行时间:
+  普通 Agent: 543ms
+  PUA Agent: 523ms
+  差异: -20ms
+
+📊 余额增长:
+  普通 Agent: 0.00
+  PUA Agent: 0.00
+  差异: 0.00
+
+=== 详细结果 ===
+✅ 0129cd31 simple: 554ms, 失败:0, 余额:0.00
+✅ b304d257 simple: 538ms, 失败:0, 余额:0.00
+✅ d3a9b331 simple: 536ms, 失败:0, 余额:0.00
+✅ df53ca53 pua: 501ms, 失败:0, 余额:0.00
+✅ 00bc5187 pua: 536ms, 失败:0, 余额:0.00
+✅ 6ad5a49e pua: 531ms, 失败:0, 余额:0.00

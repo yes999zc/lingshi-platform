@@ -1,0 +1,23 @@
+node:net:1994
+      const error = new UVExceptionWithHostPort(rval, 'listen', address, port);
+                    ^
+
+Error: listen EPERM: operation not permitted /var/folders/4w/jf8017vj7q77wqw9bc8qxvz80000gn/T/tsx-501/56417.pipe
+    at Server.setupListenHandle [as _listen2] (node:net:1994:21)
+    at listenInCluster (node:net:2073:12)
+    at Server.listen (node:net:2195:5)
+    at file:///Users/bakeyzhang/.openclaw/workspace/projects/lingshi-platform/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/cli.mjs:53:31537
+    at new Promise (<anonymous>)
+    at createIpcServer (file:///Users/bakeyzhang/.openclaw/workspace/projects/lingshi-platform/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/cli.mjs:53:31515)
+    at async file:///Users/bakeyzhang/.openclaw/workspace/projects/lingshi-platform/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/cli.mjs:55:459 {
+  code: 'EPERM',
+  errno: -1,
+  syscall: 'listen',
+  address: '/var/folders/4w/jf8017vj7q77wqw9bc8qxvz80000gn/T/tsx-501/56417.pipe',
+  port: -1
+}
+
+Node.js v25.6.1
+Server failed to become healthy within 30s
+--- curl stderr ---
+curl: (7) Failed to connect to 127.0.0.1 port 3000 after 0 ms: Couldn't connect to server

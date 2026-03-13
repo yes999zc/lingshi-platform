@@ -167,3 +167,35 @@ The Rule Engine watches `config/rules.json` for changes (via `fs.watch`). Non-br
 - `docs/ACCEPTANCE_CRITERIA.md` — MVP acceptance checklist
 - `docs/RISK_REGISTER.md` — Risk register
 - `config/rules.json` — Authoritative rule configuration
+
+---
+
+## Implementation Notes (2026-03-12)
+
+### Rule Engine Components Implemented
+
+| File | Purpose |
+|------|---------|
+| `src/engine/rule-engine.ts` | Config loader, validator, hot-reload, singleton |
+| `src/engine/scoring.ts` | Score calculation, quality multipliers, scorer isolation |
+| `src/engine/tier-manager.ts` | Tier promotion/demotion with grace period |
+| `src/engine/settlement-engine.ts` | Reward calculation, idempotency key generation |
+
+### State Machine Enhancement
+
+`task-state.ts` extended with `validateTaskTransitionWithContext()`:
+- `assigned → submitted`: Only assigned agent can submit
+- `submitted → scored`: Scorer agent ID required
+- `scored → settled`: Idempotency key required
+- New error code: `TASK_RULE_VIOLATION`
+
+### Settlement Formula
+
+```
+gross_reward = (base_reward + time_bonus) × quality_multiplier
+platform_fee = gross_reward × platform_fee_pct / 100
+net_reward   = gross_reward - platform_fee
+scorer_commission = gross_reward × scorer_commission_pct / 100
+```
+
+All values derived from `config/rules.json` — fully auditable and reproducible.

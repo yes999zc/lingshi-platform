@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   status TEXT NOT NULL DEFAULT 'open',
   agent_id TEXT,
   assigned_bid_id TEXT,
+  bidding_started_at TEXT,
+  bidding_ends_at TEXT,
   submission_payload TEXT,
   submitted_at TEXT,
   score_quality REAL,
@@ -46,9 +48,11 @@ CREATE TABLE IF NOT EXISTS bids (
   confidence REAL NOT NULL DEFAULT 0,
   estimated_cycles INTEGER NOT NULL DEFAULT 1,
   bid_stake REAL NOT NULL DEFAULT 0,
+  escrow_amount REAL NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (task_id) REFERENCES tasks (id),
-  FOREIGN KEY (agent_id) REFERENCES agents (agent_id)
+  FOREIGN KEY (agent_id) REFERENCES agents (agent_id),
+  UNIQUE (task_id, agent_id)
 );
 
 CREATE TABLE IF NOT EXISTS coalitions (
@@ -116,3 +120,17 @@ CREATE TABLE IF NOT EXISTS events (
   source TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS submissions (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (task_id) REFERENCES tasks (id),
+  FOREIGN KEY (agent_id) REFERENCES agents (agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_submissions_task_id
+  ON submissions (task_id);

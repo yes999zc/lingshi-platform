@@ -12,12 +12,18 @@ Each item below is a verifiable test case. The "Pass Condition" column defines t
 
 ## 1. Rule Engine & Configuration
 
-| ID | Test Case | Pass Condition | Priority |
-|----|-----------|----------------|----------|
-| AC-RE-01 | Load `config/rules.json` at startup | Engine starts without error; all rule values accessible via internal API | **[BLOCKER]** |
-| AC-RE-02 | Mutate a threshold in `rules.json` at runtime | Rule Engine picks up change within 5 seconds without process restart | **[REQUIRED]** |
-| AC-RE-03 | Provide malformed `rules.json` | Engine logs a validation error and refuses to apply the bad config; previous config remains active | **[BLOCKER]** |
-| AC-RE-04 | Rule values match spec defaults | All fields in `config/rules.json` match documented defaults in ADR-001 | **[REQUIRED]** |
+| ID | Test Case | Pass Condition | Priority | Status |
+|----|-----------|----------------|----------|--------|
+| AC-RE-01 | Load `config/rules.json` at startup | Engine starts without error; all rule values accessible via internal API | **[BLOCKER]** | ✅ Implemented |
+| AC-RE-02 | Mutate a threshold in `rules.json` at runtime | Rule Engine picks up change within 5 seconds without process restart | **[REQUIRED]** | ✅ Implemented |
+| AC-RE-03 | Provide malformed `rules.json` | Engine logs a validation error and refuses to apply the bad config; previous config remains active | **[BLOCKER]** | ✅ Implemented |
+| AC-RE-04 | Rule values match spec defaults | All fields in `config/rules.json` match documented defaults in ADR-001 | **[REQUIRED]** | ✅ Verified |
+
+**Implementation Notes (2026-03-12)**:
+- `rule-engine.ts`: Singleton pattern with `load()`, `getConfig()`, `getRule()`, `watch()` methods
+- Config validation checks all required sections (_meta, task, scoring, economy, tier, anti_abuse, settlement)
+- Hot-reload via `fs.watch()` with validation guard
+- Type-safe access via `RulesConfig` interface
 
 ---
 
@@ -51,15 +57,20 @@ Each item below is a verifiable test case. The "Pass Condition" column defines t
 
 ## 4. Scoring & Anti-Abuse
 
-| ID | Test Case | Pass Condition | Priority |
-|----|-----------|----------------|----------|
-| AC-SC-01 | Scorer isolation | Agent that bid on task cannot score it; attempt returns HTTP 403 | **[BLOCKER]** |
-| AC-SC-02 | Self-score rejected | Agent cannot score its own submission; returns HTTP 403 | **[BLOCKER]** |
-| AC-SC-03 | Score range enforced | Score outside `[rules.scoring.min_score, rules.scoring.max_score]` returns HTTP 422 | **[REQUIRED]** |
-| AC-SC-04 | Sybil bid detection | Agent with >N active bids (N = `rules.anti_abuse.max_concurrent_bids`) cannot place additional bid; returns HTTP 429 | **[BLOCKER]** |
-| AC-SC-05 | Bid colluder block | Two agents sharing same IP (or fingerprint) cannot bid on same task | **[REQUIRED]** |
-| AC-SC-06 | Suspension triggers | Agent whose bid withdrawal rate exceeds `rules.anti_abuse.max_withdrawal_rate` is auto-suspended; event emitted | **[REQUIRED]** |
-| AC-SC-07 | Rate limit enforcement | Agent exceeding `rules.anti_abuse.api_rate_limit_per_minute` receives HTTP 429 | **[REQUIRED]** |
+| ID | Test Case | Pass Condition | Priority | Status |
+|----|-----------|----------------|----------|--------|
+| AC-SC-01 | Scorer isolation | Agent that bid on task cannot score it; attempt returns HTTP 403 | **[BLOCKER]** | ✅ Implemented |
+| AC-SC-02 | Self-score rejected | Agent cannot score its own submission; returns HTTP 403 | **[BLOCKER]** | ✅ Implemented |
+| AC-SC-03 | Score range enforced | Score outside `[rules.scoring.min_score, rules.scoring.max_score]` returns HTTP 422 | **[REQUIRED]** | ✅ Implemented |
+| AC-SC-04 | Sybil bid detection | Agent with >N active bids (N = `rules.anti_abuse.max_concurrent_bids`) cannot place additional bid; returns HTTP 429 | **[BLOCKER]** | Pending API integration |
+| AC-SC-05 | Bid colluder block | Two agents sharing same IP (or fingerprint) cannot bid on same task | **[REQUIRED]** | Pending API integration |
+| AC-SC-06 | Suspension triggers | Agent whose bid withdrawal rate exceeds `rules.anti_abuse.max_withdrawal_rate` is auto-suspended; event emitted | **[REQUIRED]** | Pending API integration |
+| AC-SC-07 | Rate limit enforcement | Agent exceeding `rules.anti_abuse.api_rate_limit_per_minute` receives HTTP 429 | **[REQUIRED]** | Pending API integration |
+
+**Implementation Notes (2026-03-12)**:
+- `scoring.ts`: `validateScorerIsolation()` checks poster, assignee, and all bidder IDs
+- Quality multipliers: excellent (≥85% of max) = 1.2x, good (≥pass_threshold) = 1.0x, poor = 0.7x
+- Score formula: quality×0.5 + speed×0.3 + innovation×0.2
 
 ---
 
@@ -128,6 +139,47 @@ All items below must pass before any milestone is considered Done:
 - [ ] No `console.error` / unhandled promise rejections in test run output
 - [ ] All HTTP endpoints respond within 500 ms at <10 concurrent requests on dev hardware
 - [ ] WebSocket push latency <1 second under same load
+
+---
+
+## 11. Day1 QA Review (2026-03-12, Claude Architecture Lead)
+
+**Overall verdict**: ⚠️ NOT READY — 3 P0 blockers identified. Full report: `docs/reports/day1-claude-quality-report.md`
+
+### P0 Blockers (Day1 milestone CANNOT close)
+
+| ID | Issue | Evidence | Pass Criterion |
+|----|-------|----------|----------------|
+| QA-P0-01 | Zero automated test coverage for all engine modules | `find src/engine -name "*.test.ts"` returns nothing | `npm test` exits 0 with ≥20 engine unit tests |
+| QA-P0-02 | Tier grace period resets counter on stable agents | `tier-manager.ts:136-138` returns `demotion_grace_cycles` on stable evaluation | Stable agent with `grace_cycles_remaining=0` returns `grace_cycles_remaining=0` |
+| QA-P0-03 | Settlement idempotency key excludes entry type — executor and scorer share same key | `rules.json` format `{task_id}:{cycle_id}:settlement` is not entry-type-specific | Two distinct ledger entries with distinct keys survive double-settlement replay |
+
+### P1 High Priority (must fix before Day2 AB test run)
+
+| ID | Issue | Evidence | Pass Criterion |
+|----|-------|----------|----------------|
+| QA-P1-01 | AB test output parsing broken — simple-agent uses English format, regex expects Chinese | `simple-agent.ts:131` prints `Tier=`, regex at `ab-test.ts:140` matches `层级:` | AB test summary shows valid tier and balance for both agent types |
+| QA-P1-02 | `ab-test.ts` hardcodes absolute path `/Users/bakeyzhang/...` | `ab-test.ts:79` | Runs from any checkout path without ENOENT |
+| QA-P1-03 | Rule engine validation is structural-only — no value range checks | `validateConfig` accepts `platform_fee_pct: 150` | Validation rejects out-of-range values with descriptive error |
+| QA-P1-04 | `getQualityLabel` mixes ratio and absolute threshold — latent bug if `max_score` changes | `scoring.ts:45-50` | Unit test confirms correct label at boundary scores with non-default `max_score` |
+
+### P2 Backlog (Day2)
+
+| ID | Issue |
+|----|-------|
+| QA-P2-01 | No audit log for hot-reload config changes |
+| QA-P2-02 | `pua-agent.ts` leaks internal debug state in submission payload |
+| QA-P2-03 | `computeEligibleTier` sort key is `min_lingshi` only — fragile for future tiers |
+| QA-P2-04 | Ledger has no `UNIQUE(task_id, entry_type)` guard against double-payment |
+
+### Day1 Gate Checklist
+
+- [ ] QA-P0-01: `npm test` exits 0 with ≥20 engine unit tests
+- [ ] QA-P0-02: Tier grace period bug fixed and unit-tested
+- [ ] QA-P0-03: Settlement idempotency key differentiated by entry type
+- [ ] QA-P1-01: AB test output format unified; summary shows valid data for both agents
+- [ ] QA-P1-02: Hardcoded path removed from `ab-test.ts`
+- [ ] Full lifecycle smoke test passes end-to-end
 
 ---
 

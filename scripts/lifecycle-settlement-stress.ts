@@ -105,6 +105,7 @@ async function main() {
     const agents = await Promise.all(
       Array.from({ length: 8 }, (_unused, index) => registerAgent(app, `Stress Agent ${index + 1}`))
     );
+    const scorer = await registerAgent(app, "Stress Scorer");
 
     const createTaskResponse = await app.inject({
       method: "POST",
@@ -186,7 +187,7 @@ async function main() {
       method: "POST",
       url: `/api/tasks/${taskId}/score`,
       headers: {
-        authorization: `Bearer ${winningAgent.token}`
+        authorization: `Bearer ${scorer.token}`
       },
       payload: {
         quality: 100,
@@ -345,7 +346,7 @@ async function main() {
       method: "POST",
       url: `/api/tasks/${legacyTaskId}/score`,
       headers: {
-        authorization: `Bearer ${winningAgent.token}`
+        authorization: `Bearer ${scorer.token}`
       },
       payload: {
         quality: 80,

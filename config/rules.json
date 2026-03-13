@@ -69,7 +69,7 @@
   },
   "settlement": {
     "idempotency_key_algo": "sha256",
-    "idempotency_key_format": "{task_id}:{cycle_id}:settlement",
+    "idempotency_key_format": "{task_id}:{cycle_id}:{entry_type}",
     "settlement_timeout_seconds": 30,
     "allow_partial_settlement": false
   },

@@ -131,9 +131,44 @@ async function main() {
       authorization: `Bearer ${bearerToken}`
     };
 
+    const scorerResponse = await app.inject({
+      method: "POST",
+      url: "/api/agents/register",
+      payload: {
+        name: "Smoke Scorer",
+        capability_tags: ["review"],
+        initial_lingshi: 10
+      }
+    });
+
+    assert.equal(scorerResponse.statusCode, 201, "scorer registration should succeed");
+    const scorerPayload = parseJsonBody<ApiEnvelope<AgentRegisterResponse>>(scorerResponse);
+    const scorerToken = scorerPayload.data.token;
+    const scorerAuthHeader = {
+      authorization: `Bearer ${scorerToken}`
+    };
+
+    const taskPosterResponse = await app.inject({
+      method: "POST",
+      url: "/api/agents/register",
+      payload: {
+        name: "Smoke Task Poster",
+        capability_tags: ["poster"],
+        initial_lingshi: 200
+      }
+    });
+
+    assert.equal(taskPosterResponse.statusCode, 201, "task poster registration should succeed");
+    const taskPosterPayload = parseJsonBody<ApiEnvelope<AgentRegisterResponse>>(taskPosterResponse);
+    const taskPosterToken = taskPosterPayload.data.token;
+    const taskPosterAuthHeader = {
+      authorization: `Bearer ${taskPosterToken}`
+    };
+
     const createTaskResponse = await app.inject({
       method: "POST",
       url: "/api/tasks",
+      headers: taskPosterAuthHeader,
       payload: {
         title: "Smoke task",
         description: "End-to-end lifecycle check",
@@ -270,7 +305,7 @@ async function main() {
     const scoreResponse = await app.inject({
       method: "POST",
       url: `/api/tasks/${taskId}/score`,
-      headers: authHeader,
+      headers: scorerAuthHeader,
       payload: {
         quality: 92,
         speed: 88,
@@ -293,7 +328,7 @@ async function main() {
     assert.equal(settleResponse.statusCode, 200, "settlement should succeed");
     const settlePayload = parseJsonBody<ApiEnvelope<SettlementResponse>>(settleResponse);
     assert.equal(settlePayload.data.settlement.agent_id, agentId, "settlement recipient should match assignee");
-    assert.equal(settlePayload.data.settlement.amount, 108, "settlement payout should equal bounty * final_score");
+    assert.equal(settlePayload.data.settlement.amount, 107.04, "settlement payout should equal bounty * final_score");
 
     const duplicateSettleResponse = await app.inject({
       method: "POST",
