@@ -1,18 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as echarts from "echarts";
+
 import { AgentCompetitionView } from "./competition/AgentCompetitionView";
 import type { Agent, EventRecord, LedgerEntry, Task } from "./types";
+import {
+  DASHBOARD_LANG_STORAGE_KEY,
+  getStoredLanguage,
+  statusLabelFromLang,
+  translations,
+  type DashboardLang
+} from "./i18n";
 
 const STATUS_COLUMNS = ["open", "bidding", "assigned", "submitted", "scored", "settled"] as const;
-
-const statusLabels: Record<string, string> = {
-  open: "Open",
-  bidding: "Bidding",
-  assigned: "Assigned",
-  submitted: "Submitted",
-  scored: "Scored",
-  settled: "Settled"
-};
 
 const statusColors: Record<string, string> = {
   open: "#f6c45c",
@@ -40,7 +39,16 @@ async function fetchJson<T>(url: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+function wsStatusLabel(lang: DashboardLang, status: "offline" | "connecting" | "online" | "error") {
+  if (lang === "en") return status.toUpperCase();
+  if (status === "online") return "在线";
+  if (status === "connecting") return "连接中";
+  if (status === "offline") return "离线";
+  return "错误";
+}
+
 export default function App() {
+  const [lang, setLang] = useState<DashboardLang>(getStoredLanguage);
   const [activeView, setActiveView] = useState<"overview" | "competition">("overview");
   const [agents, setAgents] = useState<Agent[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -57,11 +65,15 @@ export default function App() {
   const tierChartRef = useRef<HTMLDivElement | null>(null);
   const tierChartInstance = useRef<echarts.ECharts | null>(null);
 
+  const appText = translations[lang].app;
+  const statusLabels = statusLabelFromLang(lang);
+
   const totalLingshi = useMemo(() => agents.reduce((sum, agent) => sum + (agent.lingshi_balance || 0), 0), [agents]);
   const activeAgents = useMemo(
     () => agents.filter((agent) => agent.status === "online" || agent.status === "active").length,
     [agents]
   );
+
   const completionRate = useMemo(() => {
     if (!tasks.length) return 0;
     const settled = tasks.filter((task) => task.status === "settled").length;
@@ -88,7 +100,7 @@ export default function App() {
     let total = 0;
     for (const entry of ledger) {
       const timestamp = entry.createdAt ?? entry.created_at;
-      const createdAtMs = timestamp ? Date.parse(timestamp) : NaN;
+      const createdAtMs = timestamp ? Date.parse(timestamp) : Number.NaN;
       if (Number.isFinite(createdAtMs) && createdAtMs >= dayAgo) {
         total += Math.abs(entry.amount ?? 0);
       }
@@ -172,6 +184,10 @@ export default function App() {
   }, [wsToken]);
 
   useEffect(() => {
+    localStorage.setItem(DASHBOARD_LANG_STORAGE_KEY, lang);
+  }, [lang]);
+
+  useEffect(() => {
     if (!tierChartRef.current) return;
 
     if (!tierChartInstance.current) {
@@ -200,9 +216,9 @@ export default function App() {
             }
           },
           data: [
-            { value: tierCounts.Elder, name: "Elder", itemStyle: { color: "#ffb457" } },
-            { value: tierCounts.Core, name: "Core", itemStyle: { color: "#6dd3ff" } },
-            { value: tierCounts.Outer, name: "Outer", itemStyle: { color: "#7ce0a7" } }
+            { value: tierCounts.Elder, name: appText.tierElder, itemStyle: { color: "#ffb457" } },
+            { value: tierCounts.Core, name: appText.tierCore, itemStyle: { color: "#6dd3ff" } },
+            { value: tierCounts.Outer, name: appText.tierOuter, itemStyle: { color: "#7ce0a7" } }
           ]
         }
       ]
@@ -211,7 +227,7 @@ export default function App() {
     const handleResize = () => tierChartInstance.current?.resize();
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
-  }, [tierCounts]);
+  }, [appText.tierCore, appText.tierElder, appText.tierOuter, tierCounts]);
 
   useEffect(() => {
     if (eventStreamRef.current) {
@@ -267,13 +283,16 @@ export default function App() {
         if (typeof payload.seq === "number" && payload.type) {
           setLastSeq(payload.seq);
           setEvents((prev) => {
-            const next = [...prev, {
-              seq: payload.seq ?? 0,
-              id: `${payload.seq}`,
-              event_type: payload.type ?? "event",
-              payload: payload.payload ?? null,
-              created_at: payload.emitted_at ?? new Date().toISOString()
-            }];
+            const next = [
+              ...prev,
+              {
+                seq: payload.seq ?? 0,
+                id: `${payload.seq}`,
+                event_type: payload.type ?? "event",
+                payload: payload.payload ?? null,
+                created_at: payload.emitted_at ?? new Date().toISOString()
+              }
+            ];
             return next.slice(-50);
           });
           scheduleRefresh();
@@ -295,51 +314,74 @@ export default function App() {
       <div className="bg-glow" />
       <header className="topbar">
         <div>
-          <p className="eyebrow">Lingshi Platform · Realtime Arena</p>
-          <h1>Command Center</h1>
-          <p className="sub">全局态势、任务竞标、灵石流动与事件回放</p>
+          <p className="eyebrow">{appText.eyebrow}</p>
+          <h1>{appText.title}</h1>
+          <p className="sub">{appText.subtitle}</p>
         </div>
-        <div className="ws-card">
-          <div className="ws-row">
-            <label>WS Token</label>
-            <input
-              value={wsToken}
-              onChange={(event) => setWsToken(event.target.value)}
-              placeholder="Paste agent token"
-            />
+        <div className="topbar-controls">
+          <div className="lang-switch" role="group" aria-label={appText.language}>
+            <span>{appText.language}</span>
+            <button
+              type="button"
+              className={lang === "zh" ? "lang-btn active" : "lang-btn"}
+              onClick={() => setLang("zh")}
+            >
+              ZH
+            </button>
+            <button
+              type="button"
+              className={lang === "en" ? "lang-btn active" : "lang-btn"}
+              onClick={() => setLang("en")}
+            >
+              EN
+            </button>
           </div>
-          <div className="ws-actions">
-            <button onClick={connectWebsocket} disabled={!wsToken || wsStatus === "online" || wsStatus === "connecting"}>
-              {wsStatus === "connecting" ? "Connecting" : "Connect"}
-            </button>
-            <button onClick={disconnectWebsocket} disabled={wsStatus === "offline"} className="ghost">
-              Disconnect
-            </button>
-            <span className={`ws-status ${wsStatus}`}>{wsStatus.toUpperCase()}</span>
+          <div className="ws-card">
+            <div className="ws-row">
+              <label>{appText.wsToken}</label>
+              <input
+                value={wsToken}
+                onChange={(event) => setWsToken(event.target.value)}
+                placeholder={appText.wsTokenPlaceholder}
+              />
+            </div>
+            <div className="ws-actions">
+              <button onClick={connectWebsocket} disabled={!wsToken || wsStatus === "online" || wsStatus === "connecting"}>
+                {wsStatus === "connecting" ? appText.connecting : appText.connect}
+              </button>
+              <button onClick={disconnectWebsocket} disabled={wsStatus === "offline"} className="ghost">
+                {appText.disconnect}
+              </button>
+              <span className={`ws-status ${wsStatus}`}>{wsStatusLabel(lang, wsStatus)}</span>
+            </div>
           </div>
         </div>
       </header>
 
       <section className="metrics">
         <div className="metric">
-          <span>Active Agents</span>
+          <span>{appText.activeAgents}</span>
           <strong>{activeAgents}</strong>
-          <em>{agents.length} total</em>
+          <em>
+            {agents.length} {appText.total}
+          </em>
         </div>
         <div className="metric">
-          <span>Task Completion</span>
+          <span>{appText.taskCompletion}</span>
           <strong>{completionRate}%</strong>
-          <em>{tasks.length} tasks</em>
+          <em>
+            {tasks.length} {appText.tasks}
+          </em>
         </div>
         <div className="metric">
-          <span>Total Lingshi</span>
+          <span>{appText.totalLingshi}</span>
           <strong>{totalLingshi.toFixed(1)}</strong>
-          <em>circulation</em>
+          <em>{appText.circulation}</em>
         </div>
         <div className="metric">
-          <span>Ledger Entries</span>
+          <span>{appText.ledgerEntries}</span>
           <strong>{ledger.length}</strong>
-          <em>latest updates</em>
+          <em>{appText.latestUpdates}</em>
         </div>
       </section>
 
@@ -349,14 +391,14 @@ export default function App() {
           className={activeView === "overview" ? "tab-btn active" : "tab-btn ghost"}
           onClick={() => setActiveView("overview")}
         >
-          Overview
+          {appText.overview}
         </button>
         <button
           type="button"
           className={activeView === "competition" ? "tab-btn active" : "tab-btn ghost"}
           onClick={() => setActiveView("competition")}
         >
-          Agent Competition
+          {appText.agentCompetition}
         </button>
       </section>
 
@@ -364,8 +406,8 @@ export default function App() {
         <main className="grid">
           <section className="panel leaderboard">
             <div className="panel-header">
-              <h2>Leaderboard</h2>
-              <span>Top balances + tier + presence</span>
+              <h2>{appText.leaderboard}</h2>
+              <span>{appText.leaderboardSub}</span>
             </div>
             <div className="panel-body">
               {leaderboard.map((agent, index) => (
@@ -380,14 +422,14 @@ export default function App() {
                   </div>
                 </div>
               ))}
-              {!leaderboard.length && <p className="muted">暂无 agent 数据</p>}
+              {!leaderboard.length && <p className="muted">{appText.noAgentData}</p>}
             </div>
           </section>
 
           <section className="panel kanban">
             <div className="panel-header">
-              <h2>Task Pool</h2>
-              <span>Open → Settled lifecycle</span>
+              <h2>{appText.taskPool}</h2>
+              <span>{appText.taskPoolSub}</span>
             </div>
             <div className="kanban-body">
               {STATUS_COLUMNS.map((status) => (
@@ -403,7 +445,7 @@ export default function App() {
                         <p className="task-meta">{task.id.slice(0, 8)} · {task.bounty_lingshi} LSP</p>
                       </div>
                     ))}
-                    {(tasksByStatus[status] ?? []).length === 0 && <p className="muted">暂无任务</p>}
+                    {(tasksByStatus[status] ?? []).length === 0 && <p className="muted">{appText.noTasks}</p>}
                   </div>
                 </div>
               ))}
@@ -412,30 +454,30 @@ export default function App() {
 
           <section className="panel ecosystem">
             <div className="panel-header">
-              <h2>生态健康</h2>
-              <span>活跃度 · 完成率 · 灵石流速</span>
+              <h2>{appText.ecosystemHealth}</h2>
+              <span>{appText.ecosystemHealthSub}</span>
             </div>
             <div className="panel-body ecosystem-body">
               <div className="ecosystem-score">
-                <span>Health Index</span>
+                <span>{appText.healthIndex}</span>
                 <strong>{ecosystemScore}</strong>
-                <em>综合评分</em>
+                <em>{appText.compositeScore}</em>
               </div>
               <div className="ecosystem-metrics">
                 <div>
-                  <span>Active Ratio</span>
+                  <span>{appText.activeRatio}</span>
                   <strong>{activeRatio}%</strong>
                 </div>
                 <div>
-                  <span>Backlog</span>
+                  <span>{appText.backlog}</span>
                   <strong>{backlogCount}</strong>
                 </div>
                 <div>
-                  <span>In Progress</span>
+                  <span>{appText.inProgress}</span>
                   <strong>{inProgressCount}</strong>
                 </div>
                 <div>
-                  <span>Lingshi Velocity</span>
+                  <span>{appText.lingshiVelocity}</span>
                   <strong>{ledgerVelocity.toFixed(1)}</strong>
                 </div>
               </div>
@@ -444,20 +486,20 @@ export default function App() {
 
           <section className="panel health">
             <div className="panel-header">
-              <h2>Tier Distribution</h2>
-              <span>Elder / Core / Outer</span>
+              <h2>{appText.tierDistribution}</h2>
+              <span>{appText.tierDistributionSub}</span>
             </div>
             <div className="panel-body">
               <div className="tier-chart" ref={tierChartRef} />
               <div className="tier-legend">
                 <div>
-                  <span className="dot elder" /> Elder <strong>{tierCounts.Elder}</strong>
+                  <span className="dot elder" /> {appText.tierElder} <strong>{tierCounts.Elder}</strong>
                 </div>
                 <div>
-                  <span className="dot core" /> Core <strong>{tierCounts.Core}</strong>
+                  <span className="dot core" /> {appText.tierCore} <strong>{tierCounts.Core}</strong>
                 </div>
                 <div>
-                  <span className="dot outer" /> Outer <strong>{tierCounts.Outer}</strong>
+                  <span className="dot outer" /> {appText.tierOuter} <strong>{tierCounts.Outer}</strong>
                 </div>
               </div>
             </div>
@@ -465,8 +507,8 @@ export default function App() {
 
           <section className="panel events">
             <div className="panel-header">
-              <h2>Realtime Event Stream</h2>
-              <span>{loading ? "Loading" : `Last ${events.length} events`}</span>
+              <h2>{appText.realtimeEvents}</h2>
+              <span>{loading ? appText.loading : `${appText.lastEvents} ${events.length}`}</span>
             </div>
             <div className="panel-body events-body" ref={eventStreamRef}>
               {events.map((eventItem) => (
@@ -478,12 +520,12 @@ export default function App() {
                   <code>{JSON.stringify(eventItem.payload)}</code>
                 </div>
               ))}
-              {!events.length && <p className="muted">暂无事件</p>}
+              {!events.length && <p className="muted">{appText.noEvents}</p>}
             </div>
           </section>
         </main>
       ) : (
-        <AgentCompetitionView agents={agents} tasks={tasks} events={events} wsStatus={wsStatus} />
+        <AgentCompetitionView agents={agents} tasks={tasks} events={events} wsStatus={wsStatus} lang={lang} />
       )}
     </div>
   );
